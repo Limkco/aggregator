@@ -1,0 +1,60 @@
+name: Aggregator Daily Build
+
+on:
+  schedule:
+    # 每天 UTC 时间 0:00 运行 (北京时间 8:00)
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    # [新增步骤] 1. 先生成 requirements.txt
+    # 缓存机制需要读取此文件来计算哈希值 (hashFiles)，所以必须在 setup-python 之前生成
+    - name: Generate requirements.txt
+      run: |
+        echo "requests" > requirements.txt
+
+    # [修改步骤] 2. 设置 Python 并开启缓存
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+        cache: 'pip' # 开启 pip 缓存
+        # 默认情况下，它会查找 requirements.txt 作为缓存键的依据
+
+    # [修改步骤] 3. 安装依赖
+    # 此时 pip 会优先检查缓存，如果命中则直接使用，不再从 PyPI 下载
+    - name: Install Dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Run Aggregator Script
+      env:
+        # 使用 GitHub Action 默认 Token
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        python aggregator.py
+
+    - name: Commit and Push Changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # 添加生成的文件
+        git add sub.txt nodes.txt
+        
+        # 提交更改 (如果没有变化则跳过，避免报错)
+        git commit -m "Auto-update proxy nodes [$(date)]" || exit 0
+        
+        # 推送
+        git push
