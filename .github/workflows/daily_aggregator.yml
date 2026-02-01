@@ -18,22 +18,23 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # [新增步骤] 1. 先生成 requirements.txt
-    # 缓存机制需要读取此文件来计算哈希值 (hashFiles)，所以必须在 setup-python 之前生成
+    # [修改步骤] 1. 动态生成 requirements.txt
+    # 这里我们同时写入 requests 和 PyYAML，确保脚本能解析 YAML/JSON 配置
     - name: Generate requirements.txt
       run: |
         echo "requests" > requirements.txt
+        echo "PyYAML" >> requirements.txt
 
     # [修改步骤] 2. 设置 Python 并开启缓存
+    # 缓存机制会读取上一步生成的 requirements.txt 来计算哈希值
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.9'
         cache: 'pip' # 开启 pip 缓存
-        # 默认情况下，它会查找 requirements.txt 作为缓存键的依据
 
     # [修改步骤] 3. 安装依赖
-    # 此时 pip 会优先检查缓存，如果命中则直接使用，不再从 PyPI 下载
+    # pip 会安装 requests 和 PyYAML
     - name: Install Dependencies
       run: |
         pip install -r requirements.txt
