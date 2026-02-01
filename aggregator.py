@@ -1,205 +1,217 @@
 import os
 import re
-import json
 import base64
 import requests
 import concurrent.futures
-from urllib.parse import urlparse
+import time
+import random
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- 配置部分 ---
-# 对应 C 代码中的关键字
-KEYWORDS = [
-    "vmess", "vless", "ss", "trojan", "hysteria2", "hy2", 
-    "clash", "config", "proxies"
-]
+KEYWORDS = ["vmess", "vless", "ss", "trojan", "hysteria2", "clash", "sub", "节点", "翻墙", "proxies", "v2ray", "hy","shadowsocks"]
 EXTENSIONS = ["yaml", "txt", "conf"]
-MAX_PAGES = 2  # 搜索页数限制
-CONCURRENCY = 10  # 并发下载数
-TIMEOUT = 10  # 超时时间 (秒)
-OUTPUT_FILE = "sub.txt" # 最终生成的订阅文件（Base64编码后）
-RAW_OUTPUT_FILE = "nodes.txt" # 明文节点文件（可选，方便调试）
+MAX_PAGES = 1
+CONCURRENCY = 5
+TIMEOUT = 15  # 增加超时时间
+OUTPUT_FILE = "sub.txt"
+RAW_OUTPUT_FILE = "nodes.txt"
 
-# 对应 src/parser_nodes.c 中的协议头判断
-PROTOCOLS = ["vmess://", "vless://", "ss://", "trojan://", "hysteria2://", "hy2://"]
+# 正则表达式：匹配常见的节点链接格式
+# 允许链接出现在文本的任何位置，不再局限于行首
+LINK_PATTERN = re.compile(r'(vmess|vless|ss|trojan|hysteria2|hy2)://[a-zA-Z0-9+/=_@.:?&%-]+')
+
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 class NodeAggregator:
     def __init__(self, token):
         self.github_token = token
         self.nodes = set()
-        self.headers = {
+        self.session = self._init_session()
+        self._setup_headers()
+
+    def _init_session(self):
+        """初始化带重试机制的 Session"""
+        session = requests.Session()
+        retry = Retry(
+            total=3,  # 最多重试3次
+            backoff_factor=1,  # 重试间隔 1s, 2s, 4s
+            status_forcelist=[500, 502, 503, 504], # 遇到这些错误码才重试
+            allowed_methods=["GET"]
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _setup_headers(self):
+        self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
-            "Authorization": f"token {self.github_token}" if self.github_token else None
-        }
-        # 移除 None header
-        if not self.headers["Authorization"]:
-            del self.headers["Authorization"]
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        if self.github_token:
+            self.session.headers["Authorization"] = f"token {self.github_token}"
+            logger.info("GitHub Token 已加载")
+        else:
+            logger.warning("未检测到 Token，将受到严格的 API 速率限制")
 
     def safe_base64_decode(self, text):
-        """
-        对应 src/utils_base64.c 的功能
-        尝试对字符串进行 URL-Safe Base64 解码
-        """
-        if not text:
-            return None
-        
-        # 清理非 Base64 字符 (简化版，保留关键字符)
-        text = text.strip()
-        text = text.replace('-', '+').replace('_', '/')
-        
-        # 补全 padding
+        if not text: return None
+        text = text.strip().replace('-', '+').replace('_', '/')
         padding = len(text) % 4
-        if padding > 0:
-            text += '=' * (4 - padding)
-            
+        if padding > 0: text += '=' * (4 - padding)
         try:
-            decoded_bytes = base64.b64decode(text)
-            return decoded_bytes.decode('utf-8', errors='ignore')
+            return base64.b64decode(text).decode('utf-8', errors='ignore')
         except:
             return None
 
-    def extract_nodes_from_text(self, text):
+    def parse_clash_yaml(self, content):
         """
-        对应 src/aggregator_search.c -> ExtractNodesFromText
-        从文本中提取节点链接
+        简单粗暴地从 Clash YAML 中提取 proxies 部分的 server 和 port
+        注意：这只是一个简易实现，完整的 YAML 解析需要 PyYAML 库
+        但为了不增加依赖，这里使用文本处理。
         """
-        found_nodes = []
-        if not text:
-            return found_nodes
+        # 这一步是为了让搜到的 clash 文件也能贡献一些节点
+        # 仅提取看起来像节点的配置块（这是一个极其简化的逻辑）
+        # 实际上 Clash 转 vmess 链接很复杂，这里仅作为“尽力而为”的补充
+        # 如果你想精准解析，建议还是只依靠近标准链接
+        pass 
+        # 考虑到转换复杂性及准确度，本次优化暂不包含复杂的 YAML->Link 转换
+        # 而是专注于从 YAML 中提取可能存在的原始链接
 
-        # 1. 尝试按行读取直接匹配
-        lines = text.split('\n')
-        for line in lines:
-            line = line.strip()
-            for proto in PROTOCOLS:
-                if line.startswith(proto):
-                    found_nodes.append(line)
-                    break
+    def extract_nodes(self, text):
+        """使用正则从文本中提取所有节点"""
+        if not text: return []
         
-        # 2. 如果没找到，尝试 Base64 解码后再找
-        if not found_nodes:
-            decoded = self.safe_base64_decode(text)
-            if decoded:
-                lines = decoded.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    for proto in PROTOCOLS:
-                        if line.startswith(proto):
-                            found_nodes.append(line)
-                            break
-                            
-        return found_nodes
+        # 1. 直接正则匹配
+        found = LINK_PATTERN.findall(text)
+        
+        # 2. 尝试 Base64 解码后再匹配
+        # 很多订阅链接返回的是 Base64 编码后的内容
+        decoded = self.safe_base64_decode(text)
+        if decoded:
+            found_in_decoded = LINK_PATTERN.findall(decoded)
+            found.extend(found_in_decoded)
+            
+        return found
 
-    def fetch_github_file(self, url):
-        """
-        对应 src/aggregator_search.c -> SearchDownloadWorker
-        下载 GitHub 原始文件内容
-        """
+    def fetch_url(self, url):
         try:
-            # 将 html_url 转换为 raw_url (简易处理，API返回通常有 download_url)
-            # 但这里我们直接用 requests 请求 API 返回的 download_url 或者构造 raw
-            resp = requests.get(url, timeout=TIMEOUT)
+            resp = self.session.get(url, timeout=TIMEOUT)
             if resp.status_code == 200:
                 return resp.text
         except Exception:
-            pass
+            pass # 忽略网络错误，由 Session 重试或跳过
         return None
 
     def search_github(self):
-        """
-        对应 src/aggregator_search.c -> SearchGitHubKeywords
-        """
-        print(f"[*] 开始搜索 GitHub, 关键字数量: {len(KEYWORDS)}")
+        logger.info(f"开始搜索 GitHub, 关键字: {len(KEYWORDS)} 个")
         download_queue = []
-
-        # 搜索阶段
+        random.shuffle(KEYWORDS) # 打乱顺序
+        
+        total_requests = 0
+        
         for keyword in KEYWORDS:
             for ext in EXTENSIONS:
                 for page in range(1, MAX_PAGES + 1):
+                    if total_requests >= 25: # 安全阈值
+                        logger.info("达到单次运行安全请求限制，停止搜索")
+                        return download_queue
+
                     query = f"{keyword} extension:{ext}"
-                    api_url = f"https://api.github.com/search/code?q={query}&per_page=20&page={page}&sort=indexed&order=desc"
+                    # 使用 text_match 获取上下文（可选，目前主要用 download_url）
+                    api_url = f"https://api.github.com/search/code?q={query}&per_page=15&page={page}&sort=indexed&order=desc"
                     
                     try:
-                        print(f"  -> 搜索: {query} (Page {page})")
-                        resp = requests.get(api_url, headers=self.headers, timeout=TIMEOUT)
+                        logger.info(f"搜索: {query} (Page {page})")
+                        resp = self.session.get(api_url) # 使用带重试的 session
+                        total_requests += 1
                         
-                        if resp.status_code == 403:
-                            print("  [!] API 速率限制或未授权")
-                            break
+                        if resp.status_code in [403, 429]:
+                            logger.warning("触发 API 速率限制，休眠 60 秒...")
+                            time.sleep(60)
+                            continue
                         
                         if resp.status_code != 200:
+                            logger.error(f"API 错误: {resp.status_code}")
+                            time.sleep(5)
                             continue
 
-                        data = resp.json()
-                        items = data.get("items", [])
-                        if not items:
-                            break
-                            
+                        items = resp.json().get("items", [])
                         for item in items:
-                            # 优先使用 html_url 转换为 raw url
                             html_url = item.get("html_url")
                             if html_url:
                                 raw_url = html_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
                                 download_queue.append(raw_url)
-                                
+                        
+                        # 随机休眠
+                        sleep_time = random.uniform(5, 10)
+                        time.sleep(sleep_time)
+
                     except Exception as e:
-                        print(f"  [!] 搜索请求错误: {e}")
+                        logger.error(f"搜索异常: {e}")
+                        time.sleep(5)
         
-        print(f"[*] 搜索完成，共找到 {len(download_queue)} 个潜在文件，准备下载...")
         return download_queue
 
-    def process_downloads(self, urls):
-        """
-        多线程下载并处理
-        """
+    def run(self):
+        urls = self.search_github()
+        unique_urls = list(set(urls))
+        logger.info(f"搜索完成，准备下载 {len(unique_urls)} 个文件")
+
+        if not unique_urls:
+            logger.warning("未找到文件")
+            return
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-            future_to_url = {executor.submit(self.fetch_github_file, url): url for url in urls}
+            future_to_url = {executor.submit(self.fetch_url, url): url for url in unique_urls}
             
+            count = 0
             for future in concurrent.futures.as_completed(future_to_url):
-                url = future_to_url[future]
                 try:
                     content = future.result()
-                    if content:
-                        extracted = self.extract_nodes_from_text(content)
-                        if extracted:
-                            # print(f"  [+] {url} 提取到 {len(extracted)} 个节点")
-                            for node in extracted:
-                                self.nodes.add(node) # Set 自动去重
+                    nodes = self.extract_nodes(content)
+                    if nodes:
+                        for node in nodes:
+                            self.nodes.add(node)
+                    count += 1
+                    if count % 10 == 0:
+                        logger.info(f"下载进度: {count}/{len(unique_urls)}")
                 except Exception:
                     pass
 
-    def run(self):
-        # 1. 搜索
-        urls = self.search_github()
-        
-        # 2. 下载并聚合
-        self.process_downloads(urls)
-        
-        print(f"[*] 聚合完成，共获取 {len(self.nodes)} 个唯一节点")
-        
-        if not self.nodes:
-            print("[!] 未找到有效节点，脚本结束")
-            return
+        logger.info(f"聚合完成，共获取 {len(self.nodes)} 个唯一节点")
 
-        # 3. 输出处理 (对应 src/aggregator_core.c 的最终输出)
-        # 将所有节点拼接，并进行 Base64 编码
-        plain_text = "\n".join(self.nodes)
-        
-        # 保存明文 (可选)
-        with open(RAW_OUTPUT_FILE, 'w', encoding='utf-8') as f:
-            f.write(plain_text)
+        if self.nodes:
+            # 结果输出
+            plain_text = "\n".join(self.nodes)
             
-        # 保存 Base64 订阅格式
-        b64_content = base64.b64encode(plain_text.encode('utf-8')).decode('utf-8')
-        with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-            f.write(b64_content)
-            
-        print(f"[*] 结果已保存至: {OUTPUT_FILE} (及 {RAW_OUTPUT_FILE})")
+            # 1. 保存明文
+            try:
+                with open(RAW_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                    f.write(plain_text)
+            except Exception as e:
+                logger.error(f"保存明文失败: {e}")
+
+            # 2. 保存 Base64
+            try:
+                b64_content = base64.b64encode(plain_text.encode('utf-8')).decode('utf-8')
+                with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                    f.write(b64_content)
+                logger.info("结果保存成功")
+            except Exception as e:
+                logger.error(f"保存 Base64 失败: {e}")
+        else:
+            logger.warning("结果为空，未生成文件")
 
 if __name__ == "__main__":
-    # 从环境变量获取 Token，确保安全
     token = os.environ.get("GH_TOKEN")
-    if not token:
-        print("[!] 警告: 未检测到 GH_TOKEN，GitHub API 请求可能会受到严格限制")
-    
     aggregator = NodeAggregator(token)
     aggregator.run()
