@@ -11,7 +11,7 @@ from urllib3.util.retry import Retry
 
 # --- 配置部分 ---
 KEYWORDS = ["vmess", "vless", "ss", "trojan", "hysteria2", "clash", "sub", "节点", "翻墙", "proxies", "v2ray", "hy","shadowsocks"]
-EXTENSIONS = ["yaml", "txt", "conf"]
+EXTENSIONS = ["yaml", "txt", "conf", "json", ""]
 MAX_PAGES = 1
 CONCURRENCY = 5
 TIMEOUT = 10 
