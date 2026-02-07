@@ -46,12 +46,18 @@ jobs:
       run: |
         python aggregator.py
 
+    # [新增步骤] 运行节点存活检测脚本
+    # 注意：此脚本需要在 aggregator.py 生成 nodes.txt 之后运行
+    - name: Run Check Active Script
+      run: |
+        python check_active.py
+
     - name: Commit and Push Changes
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         
-        # 添加生成的文件
+        # 添加生成的文件 (这两个文件会被 check_active.py 更新)
         git add sub.txt nodes.txt
         
         # 提交更改 (如果没有变化则跳过，避免报错)
