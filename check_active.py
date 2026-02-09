@@ -3,7 +3,7 @@ import json
 import base64
 import socket
 import concurrent.futures
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, parse_qs
 
 # --- 配置 ---
 INPUT_FILE = "nodes.txt"
@@ -39,21 +39,17 @@ def parse_node_info(node_link):
 
         elif node_link.startswith("ss://"):
             # Shadowsocks 协议
-            # 格式 1: ss://method:pass@host:port
-            # 格式 2 (Aggregator 生成): ss://base64_user_info@host:port#name
             try:
                 parsed = urlparse(node_link)
                 host = parsed.hostname
                 port = parsed.port
                 
-                # 如果 urlparse 没解析出 host (可能是旧版纯 Base64 格式 ss://Base64)
+                # 兼容旧版纯 Base64 格式
                 if not host and '#' not in node_link and '@' not in node_link:
-                    # 尝试解码 ss:// 后面的部分
                     body = node_link[5:]
                     padding = len(body) % 4
                     if padding > 0: body += "=" * (4 - padding)
                     decoded = base64.b64decode(body).decode("utf-8")
-                    # 解码后通常是 method:pass@host:port
                     if '@' in decoded:
                         part = decoded.split('@')[1]
                         host, port_str = part.split(':')
@@ -63,7 +59,6 @@ def parse_node_info(node_link):
 
         else:
             # 通用格式 (trojan://, vless://, hysteria2:// 等)
-            # 结构通常为 protocol://user@host:port...
             try:
                 parsed = urlparse(node_link)
                 host = parsed.hostname
@@ -76,10 +71,60 @@ def parse_node_info(node_link):
             port = int(port)
             
     except Exception as e:
-        # print(f"解析错误: {e}")
         pass
 
     return host, port
+
+def is_tls_node(node_link):
+    """
+    判断节点是否为 TLS 节点
+    """
+    node_link = node_link.strip()
+    
+    try:
+        # 1. VMess
+        if node_link.startswith("vmess://"):
+            b64_str = node_link[8:]
+            padding = len(b64_str) % 4
+            if padding > 0:
+                b64_str += "=" * (4 - padding)
+            try:
+                conf_str = base64.b64decode(b64_str).decode("utf-8")
+                conf = json.loads(conf_str)
+                # 检查 tls 字段
+                if conf.get("tls") == "tls":
+                    return True
+            except:
+                return False
+            return False
+
+        # 2. VLESS / Trojan / Hysteria2
+        if node_link.startswith(("vless://", "trojan://", "hysteria2://", "hy2://")):
+            parsed = urlparse(node_link)
+            qs = parse_qs(parsed.query)
+            security = qs.get("security", [""])[0]
+            
+            # 如果显式声明了 security=tls 或 reality，则为真
+            if security in ["tls", "reality"]:
+                return True
+            
+            # Trojan 特殊处理：如果没有 security 参数，通常默认也是 TLS
+            # 但如果 explicit 声明了 security=none，则不算
+            if node_link.startswith("trojan://") and not security:
+                return True
+                
+            return False
+
+        # 3. SS (Shadowsocks)
+        # SS 原生不支持 TLS，除非使用 v2ray-plugin 且开启 tls
+        # 这里为了严格过滤，默认 SS 视为非 TLS，除非你确实需要解析插件参数
+        if node_link.startswith("ss://"):
+            return False
+
+    except Exception:
+        return False
+
+    return False
 
 def is_port_open(host, port):
     """
@@ -108,11 +153,8 @@ def check_node(node):
             print(f"[在线] {host}:{port}")
             return node
         else:
-            # print(f"[离线] {host}:{port}")
             return None
     else:
-        # 如果无法解析出地址端口，保守起见保留或丢弃？这里选择丢弃非法格式
-        # print(f"[跳过] 格式无法解析")
         return None
 
 def main():
@@ -125,14 +167,26 @@ def main():
         # 过滤空行
         nodes = [line.strip() for line in f if line.strip()]
 
-    total = len(nodes)
-    print(f"共加载 {total} 个节点，开始 TCP 连通性测试 (超时: {TIMEOUT}秒)...")
+    total_raw = len(nodes)
+    print(f"原始加载节点数: {total_raw}")
+
+    # --- 新增步骤：过滤非 TLS 节点 ---
+    print("正在过滤非 TLS 节点...")
+    tls_nodes = [node for node in nodes if is_tls_node(node)]
+    total_tls = len(tls_nodes)
+    print(f"保留 TLS 节点数: {total_tls} (移除了 {total_raw - total_tls} 个非 TLS 节点)")
+
+    if total_tls == 0:
+        print("警告: 没有剩余的 TLS 节点，脚本结束。")
+        return
+
+    print(f"开始 TCP 连通性测试 (超时: {TIMEOUT}秒, 线程: {MAX_WORKERS})...")
 
     valid_nodes = []
     
-    # 使用线程池并发测试
+    # 使用线程池并发测试 (只测试过滤后的 tls_nodes)
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_node = {executor.submit(check_node, node): node for node in nodes}
+        future_to_node = {executor.submit(check_node, node): node for node in tls_nodes}
         
         for i, future in enumerate(concurrent.futures.as_completed(future_to_node)):
             result = future.result()
@@ -140,13 +194,13 @@ def main():
                 valid_nodes.append(result)
             
             # 简单的进度显示
-            if (i + 1) % 10 == 0:
-                print(f"进度: {i + 1}/{total}")
+            if (i + 1) % 50 == 0:
+                print(f"进度: {i + 1}/{total_tls}")
 
     print("-" * 30)
     print(f"检测完成！")
-    print(f"原始节点数: {total}")
-    print(f"有效节点数: {len(valid_nodes)}")
+    print(f"输入节点数 (TLS): {total_tls}")
+    print(f"存活节点数: {len(valid_nodes)}")
     print("-" * 30)
 
     # 1. 保存到 nodes.txt (明文)
@@ -158,7 +212,6 @@ def main():
         print(f"保存 {OUTPUT_FILE} 失败: {e}")
 
     # 2. 同步保存到 sub.txt (Base64 订阅)
-    # Aggregator 也会生成这个文件，为了保持一致性，这里也顺便更新
     try:
         plain_text = "\n".join(valid_nodes)
         b64_content = base64.b64encode(plain_text.encode('utf-8')).decode('utf-8')
