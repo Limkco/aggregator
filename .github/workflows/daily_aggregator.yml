@@ -16,25 +16,28 @@ jobs:
 
     steps:
     - name: Checkout Code
+      # [激进模式] 使用 main 分支，获取插件的最新开发代码
       uses: actions/checkout@main
 
-    # [修改步骤] 1. 动态生成 requirements.txt
+    # 1. 动态生成 requirements.txt
     # 这里我们同时写入 requests 和 PyYAML，确保脚本能解析 YAML/JSON 配置
     - name: Generate requirements.txt
       run: |
         echo "requests" > requirements.txt
         echo "PyYAML" >> requirements.txt
 
-    # [修改步骤] 2. 设置 Python 并开启缓存
-    # 缓存机制会读取上一步生成的 requirements.txt 来计算哈希值
+    # 2. 设置 Python 为全网最新
     - name: Set up Python
+      # [激进模式] 使用 main 分支的 setup-python 插件
       uses: actions/setup-python@main
       with:
+        # [激进模式] 'x' 代表任意最新版本 (自动匹配 3.13, 3.14, 甚至未来的 4.0)
         python-version: 'x'
+        # 强制检查是否有新版本发布，而不是用缓存的旧版
         check-latest: true
         cache: 'pip' # 开启 pip 缓存
 
-    # [修改步骤] 3. 安装依赖
+    # 3. 安装依赖
     # pip 会安装 requests 和 PyYAML
     - name: Install Dependencies
       run: |
@@ -47,7 +50,7 @@ jobs:
       run: |
         python aggregator.py
 
-    # [新增步骤] 运行节点存活检测脚本
+    # 运行节点存活检测脚本
     # 注意：此脚本需要在 aggregator.py 生成 nodes.txt 之后运行
     - name: Run Check Active Script
       run: |
