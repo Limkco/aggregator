@@ -16,7 +16,7 @@ jobs:
 
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v4
+      uses: actions/checkout@main
 
     # [修改步骤] 1. 动态生成 requirements.txt
     # 这里我们同时写入 requests 和 PyYAML，确保脚本能解析 YAML/JSON 配置
@@ -28,9 +28,9 @@ jobs:
     # [修改步骤] 2. 设置 Python 并开启缓存
     # 缓存机制会读取上一步生成的 requirements.txt 来计算哈希值
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@main
       with:
-        python-version: '3.9'
+        python-version: 'x'
         cache: 'pip' # 开启 pip 缓存
 
     # [修改步骤] 3. 安装依赖
