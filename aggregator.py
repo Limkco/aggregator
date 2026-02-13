@@ -32,10 +32,10 @@ KEYWORDS: List[str] = [
 EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
 
 MAX_PAGES: int = 5            # 搜索页数
-SEARCH_INTERVAL: float = 2.0  # 搜索请求间隔(秒)
+SEARCH_INTERVAL: float = 3.0  # 搜索请求间隔(秒)
 MAX_EXECUTION_TIME: int = 600 # 最大运行时间 10分钟
 TIMEOUT: int = 10             # 下载超时时间(秒)
-DOWNLOAD_WORKERS: int = 20    # 下载解析线程数 (并发度)
+DOWNLOAD_WORKERS: int = 15    # 下载解析线程数 (并发度)
 
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
