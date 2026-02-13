@@ -5,7 +5,8 @@ import json
 import time
 import random
 import logging
-import concurrent.futures
+import threading
+import queue
 from urllib.parse import quote
 from typing import List, Set, Dict, Any, Optional, Tuple, Union
 
@@ -19,26 +20,28 @@ try:
 except ImportError:
     yaml = None
 
-# --- 配置常量 ---
+# --- 配置部分 ---
+# 关键词优化：移除重叠度高的词，保留核心高价值词
 KEYWORDS: List[str] = [
-    "vmess", "vless", "sock", "trojan", "shadowsocks", 
-    "hysteria", "hysteria2", "hy", "hy2", "clash", 
-    "sub", "上网节点", "proxies", "v2ray", "翻墙节点", "机场节点"
+    "proxies", "clash", "subscription", "vmess", "vless", 
+    "trojan", "shadowsocks", "hysteria2", "sub", "config", 
+    "v2ray", "ss", "节点", "机场", "翻墙"
 ]
 
+# 扩展名配置：增加 yml
 EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
-MAX_PAGES: int = 3
-CONCURRENCY: int = 5
-TIMEOUT: int = 10
-MAX_EXECUTION_TIME: int = 600  # 10分钟
+
+MAX_PAGES: int = 5           # 搜索页数增加到5页，获取更多结果
+SEARCH_INTERVAL: float = 2.0 # 两次搜索请求的最小间隔(秒)
+MAX_EXECUTION_TIME: int = 600 # 最大运行时间 10分钟
+DOWNLOAD_WORKERS: int = 20   # 下载解析线程数 (增加并发以处理更多文件)
 
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
-# 正则表达式：支持标准协议头，支持 #备注 和 [] 包裹的 IPv6
+# 正则表达式
 LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[a-zA-Z0-9+/=_@.:?&%#\[\]-]+')
 
-# --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -50,19 +53,28 @@ class NodeAggregator:
     def __init__(self, token: Optional[str]):
         self.github_token = token
         self.nodes: Set[str] = set()
-        self.session = self._init_session()
-        self.start_time = time.time()
+        self.nodes_lock = threading.Lock() # 线程锁，保护集合写入
         
+        self.session = self._init_session()
         self._setup_headers()
         
-        # 根据 Token 状态动态调整速率限制
-        self.max_requests = 500 if token else 30
+        self.start_time = time.time()
+        self.should_stop = False # 全局停止标志
         
+        # 任务队列 (生产者-消费者模型)
+        self.url_queue = queue.Queue()
+        
+        # 动态调整策略
+        if token:
+            self.sleep_interval = SEARCH_INTERVAL
+        else:
+            self.sleep_interval = 10.0 # 无Token需保守
+            logger.warning("未检测到 Token，速率限制将受限，建议配置 GH_TOKEN")
+
         if not yaml:
-            logger.warning("未检测到 PyYAML 库，YAML 解析功能将不可用。建议在 requirements.txt 中添加 PyYAML。")
+            logger.warning("未检测到 PyYAML 库，YAML 解析功能将不可用。建议安装 PyYAML。")
 
     def _init_session(self) -> requests.Session:
-        """初始化带有重试机制的 Session"""
         session = requests.Session()
         retry = Retry(
             total=3,
@@ -76,7 +88,6 @@ class NodeAggregator:
         return session
 
     def _setup_headers(self) -> None:
-        """设置请求头"""
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -84,41 +95,29 @@ class NodeAggregator:
         if self.github_token:
             self.session.headers["Authorization"] = f"token {self.github_token}"
             logger.info("GitHub Token 已加载")
-        else:
-            logger.warning("未检测到 Token，速率限制将受限")
 
-    def check_timeout(self) -> Tuple[bool, float]:
-        """检查是否达到最大执行时间"""
-        elapsed = time.time() - self.start_time
-        if elapsed > MAX_EXECUTION_TIME:
-            return True, elapsed
-        return False, elapsed
+    def check_timeout(self) -> bool:
+        if time.time() - self.start_time > MAX_EXECUTION_TIME:
+            return True
+        return False
 
     def safe_base64_decode(self, text: str) -> Optional[str]:
-        """安全的 Base64 解码，处理 URL 安全字符和填充"""
         if not text:
             return None
-        # 清理非法字符
         text = text.strip().replace(' ', '').replace('\n', '').replace('\r', '')
-        # URL Safe 替换
         text = text.replace('-', '+').replace('_', '/')
-        
-        # 补全填充
         padding = len(text) % 4
         if padding > 0:
             text += '=' * (4 - padding)
-            
         try:
             return base64.b64decode(text).decode('utf-8', errors='ignore')
         except Exception:
             return None
 
-    # --- 节点组装逻辑 ---
+    # --- [完整保留] 节点构建逻辑 ---
 
     def _build_vmess_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将字典配置转换为 vmess:// 标准链接"""
         try:
-            # 映射 Clash/通用字段到 VMess 分享标准字段
             v2ray_json = {
                 "v": "2",
                 "ps": str(config.get("name", "unnamed")),
@@ -128,17 +127,13 @@ class NodeAggregator:
                 "aid": str(config.get("alterId", 0)),
                 "scy": str(config.get("cipher", "auto")),
                 "net": str(config.get("network", "tcp")),
-                "type": str(config.get("type", "none")), # header type
+                "type": str(config.get("type", "none")),
                 "host": str(config.get("servername") or config.get("ws-opts", {}).get("headers", {}).get("Host", "")),
                 "path": str(config.get("ws-path") or config.get("ws-opts", {}).get("path", "")),
                 "tls": "tls" if config.get("tls") else ""
             }
-            
-            # 基础验证
             if not v2ray_json["add"] or not v2ray_json["id"]:
                 return None
-            
-            # 生成紧凑的 JSON 字符串
             json_str = json.dumps(v2ray_json, separators=(',', ':'))
             b64_str = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
             return f"vmess://{b64_str}"
@@ -146,17 +141,14 @@ class NodeAggregator:
             return None
 
     def _build_ss_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将字典配置转换为 ss:// 标准链接"""
         try:
             server = config.get("server")
             port = config.get("port")
             password = config.get("password")
             method = config.get("cipher")
             name = config.get("name", "ss_node")
-
             if not (server and port and password and method):
                 return None
-
             user_info = f"{method}:{password}"
             b64_user_info = base64.b64encode(user_info.encode('utf-8')).decode('utf-8').strip()
             safe_name = quote(str(name))
@@ -165,17 +157,14 @@ class NodeAggregator:
             return None
 
     def _build_trojan_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将字典配置转换为 trojan:// 标准链接"""
         try:
             server = config.get("server")
             port = config.get("port")
             password = config.get("password")
             name = config.get("name", "trojan_node")
             sni = config.get("sni") or config.get("servername")
-
             if not (server and port and password):
                 return None
-            
             query = f"?peer={sni}" if sni else ""
             safe_name = quote(str(name))
             return f"trojan://{password}@{server}:{port}{query}#{safe_name}"
@@ -183,30 +172,22 @@ class NodeAggregator:
             return None
 
     def _parse_structured_node(self, proxy_item: Dict[str, Any]) -> Optional[str]:
-        """根据协议类型分发处理"""
         if not isinstance(proxy_item, dict):
             return None
-        
         protocol = str(proxy_item.get("type", "")).lower()
-        
         if protocol == "vmess":
             return self._build_vmess_link(proxy_item)
         elif protocol in ["ss", "shadowsocks"]:
             return self._build_ss_link(proxy_item)
         elif protocol == "trojan":
             return self._build_trojan_link(proxy_item)
-        # 可以在此扩展 vless 等其他协议
         return None
 
     def _extract_from_structured_data(self, data: Union[Dict, List]) -> List[str]:
-        """从 JSON/YAML 数据结构中提取节点"""
         extracted = []
         proxy_list = []
-
-        # 1. 检查是否为 Clash 格式 (包含 'proxies' 列表)
         if isinstance(data, dict) and "proxies" in data and isinstance(data["proxies"], list):
             proxy_list = data["proxies"]
-        # 2. 检查是否为纯列表结构
         elif isinstance(data, list):
             proxy_list = data
         
@@ -214,173 +195,181 @@ class NodeAggregator:
             link = self._parse_structured_node(item)
             if link:
                 extracted.append(link)
-        
         return extracted
 
-    # --- 核心提取方法 ---
+    # --- [完整保留] 提取核心逻辑 ---
 
     def extract_nodes(self, text: str) -> List[str]:
         if not text:
             return []
         found_nodes = []
         
-        # 策略 1: 正则直接提取 (针对纯文本链接或混合文本)
+        # 策略 1: 正则直接提取
         regex_matches = LINK_PATTERN.findall(text)
         found_nodes.extend(regex_matches)
         
-        # 策略 2: Base64 解码后正则提取 (针对 Base64 订阅内容)
+        # 策略 2: Base64 解码后正则提取
         decoded = self.safe_base64_decode(text)
         if decoded:
             decoded_matches = LINK_PATTERN.findall(decoded)
             found_nodes.extend(decoded_matches)
 
-        # 策略 3: 尝试解析为结构化数据 (JSON/YAML)
+        # 策略 3: JSON/YAML 解析
         text_stripped = text.strip()
         is_json_like = text_stripped.startswith('{') or text_stripped.startswith('[')
         is_yaml_like = "proxies:" in text_stripped or "name:" in text_stripped
 
         parsed_data = None
-        
-        # 3.1 尝试 JSON 解析
         if is_json_like:
             try:
                 parsed_data = json.loads(text_stripped)
             except json.JSONDecodeError:
                 pass
         
-        # 3.2 尝试 YAML 解析
         if parsed_data is None and is_yaml_like and yaml:
             try:
                 parsed_data = yaml.safe_load(text_stripped)
             except Exception:
                 pass
         
-        # 3.3 如果解析成功，提取节点
         if parsed_data:
             structured_nodes = self._extract_from_structured_data(parsed_data)
             if structured_nodes:
-                logger.info(f"从结构化数据中解析出 {len(structured_nodes)} 个节点")
                 found_nodes.extend(structured_nodes)
             
         return found_nodes
 
-    def fetch_url(self, url: str) -> Optional[str]:
-        """下载单个 URL 内容"""
-        try:
-            resp = self.session.get(url, timeout=TIMEOUT)
-            if resp.status_code == 200:
-                return resp.text
-        except Exception:
-            pass
-        return None
+    # --- [架构更新] 生产者-消费者逻辑 ---
 
-    def search_github(self) -> List[str]:
-        """执行 GitHub 代码搜索"""
-        logger.info(f"开始搜索 GitHub, 关键字: {len(KEYWORDS)} 个")
-        download_queue = []
+    def fetch_worker(self):
+        """消费者线程：从队列获取URL并下载解析"""
+        while not self.should_stop:
+            try:
+                # 阻塞等待，每秒检查一次停止标志
+                url = self.url_queue.get(timeout=1) 
+            except queue.Empty:
+                continue
+            
+            try:
+                resp = self.session.get(url, timeout=10)
+                if resp.status_code == 200:
+                    # 调用完整的提取逻辑
+                    nodes = self.extract_nodes(resp.text)
+                    if nodes:
+                        with self.nodes_lock:
+                            count_before = len(self.nodes)
+                            for node in nodes:
+                                self.nodes.add(node)
+                            # 简单的进度展示
+                            if len(self.nodes) > count_before and len(self.nodes) % 50 == 0:
+                                logger.info(f"当前库存: {len(self.nodes)} 个唯一节点")
+            except Exception:
+                pass
+            finally:
+                self.url_queue.task_done()
+
+    def search_producer(self):
+        """生产者线程：执行搜索并将结果推入队列"""
+        logger.info(f"开始搜索 GitHub, 关键词队列: {len(KEYWORDS)} 个")
+        random.shuffle(KEYWORDS) # 打乱顺序
         
-        # 随机打乱关键字以优化搜索覆盖面
-        search_keywords = list(KEYWORDS)
-        random.shuffle(search_keywords)
-        
-        total_requests = 0
-        
-        for keyword in search_keywords:
+        for keyword in KEYWORDS:
+            if self.should_stop: break
+            
             for ext in EXTENSIONS:
+                if self.should_stop: break
+                
+                # 智能跳过：如果第一页都没结果，通常后面也没有
+                found_items_in_this_combo = False
+                
                 for page in range(1, MAX_PAGES + 1):
-                    # 超时检查
-                    is_timeout, elapsed = self.check_timeout()
-                    if is_timeout:
-                        logger.warning(f"已运行 {elapsed:.0f}秒，超时停止搜索。")
-                        return download_queue
-
-                    # API 限制检查
-                    if total_requests >= self.max_requests: 
-                        logger.info(f"达到单次运行 API 请求限制 ({self.max_requests})，停止搜索")
-                        return download_queue
+                    if self.should_stop: break
+                    if self.check_timeout():
+                        logger.warning("达到最大执行时间，停止搜索")
+                        self.should_stop = True
+                        return
 
                     query = f"{keyword} extension:{ext}"
-                    api_url = f"https://api.github.com/search/code?q={query}&per_page=15&page={page}&sort=indexed&order=desc"
+                    # 排序使用 indexed desc (最近索引)
+                    api_url = f"https://api.github.com/search/code?q={query}&per_page=20&page={page}&sort=indexed&order=desc"
                     
                     try:
-                        logger.info(f"搜索: {query} (Page {page})")
                         resp = self.session.get(api_url)
-                        total_requests += 1
                         
+                        # 处理速率限制
                         if resp.status_code in [403, 429]:
-                            logger.warning("触发 API 速率限制，休眠 60 秒...")
-                            # 预判休眠后是否超时
-                            if time.time() - self.start_time + 60 > MAX_EXECUTION_TIME:
-                                return download_queue
-                            time.sleep(60)
+                            logger.warning("触发 API 速率限制，暂停 45 秒...")
+                            time.sleep(45)
                             continue
                         
-                        if resp.status_code != 200:
-                            logger.error(f"API 错误: {resp.status_code}")
+                        if resp.status_code == 200:
+                            items = resp.json().get("items", [])
+                            logger.info(f"搜索 [{query} P{page}] -> 找到 {len(items)} 个文件")
+                            
+                            if not items:
+                                # 当前页无结果，停止翻页
+                                break
+                            
+                            found_items_in_this_combo = True
+                            
+                            for item in items:
+                                html_url = item.get("html_url")
+                                if html_url:
+                                    # 转换为 raw 链接
+                                    raw_url = html_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                                    self.url_queue.put(raw_url)
+                        else:
+                            logger.error(f"API 错误 {resp.status_code}")
                             time.sleep(5)
-                            continue
 
-                        items = resp.json().get("items", [])
-                        for item in items:
-                            html_url = item.get("html_url")
-                            if html_url:
-                                # 转换 blob URL 为 raw URL
-                                raw_url = html_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-                                download_queue.append(raw_url)
-                        
-                        # 随机延迟防止触发二级风控
-                        sleep_time = random.uniform(5, 10)
+                        # 动态随机休眠
+                        sleep_time = random.uniform(self.sleep_interval, self.sleep_interval + 1.5)
                         time.sleep(sleep_time)
 
                     except Exception as e:
-                        logger.error(f"搜索异常: {e}")
+                        logger.error(f"搜索请求异常: {e}")
                         time.sleep(5)
-        
-        return download_queue
+                
+                # 如果第一页就没结果，不需要继续翻页，也不需要继续搜这个后缀的其他组合（视情况而定，这里简化处理）
+                if not found_items_in_this_combo:
+                    pass 
+
+        logger.info("所有搜索任务已遍历完成")
 
     def run(self):
-        """主执行流程"""
-        urls = self.search_github()
-        unique_urls = list(set(urls))
-        logger.info(f"搜索阶段结束，准备下载 {len(unique_urls)} 个文件")
-
-        if unique_urls:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-                future_to_url = {executor.submit(self.fetch_url, url): url for url in unique_urls}
-                
-                count = 0
-                for future in concurrent.futures.as_completed(future_to_url):
-                    is_timeout, elapsed = self.check_timeout()
-                    if is_timeout:
-                        logger.warning("下载阶段超时，保存现有结果...")
-                        for f in future_to_url:
-                            f.cancel()
-                        break
-
-                    try:
-                        content = future.result()
-                        if content:
-                            # 提取节点并去重
-                            nodes = self.extract_nodes(content)
-                            if nodes:
-                                for node in nodes:
-                                    self.nodes.add(node)
-                        
-                        count += 1
-                        if count % 10 == 0:
-                            logger.info(f"下载进度: {count}/{len(unique_urls)}")
-                    except Exception as e:
-                        logger.debug(f"处理文件时发生错误: {e}")
-
-        logger.info(f"聚合完成，共获取 {len(self.nodes)} 个唯一节点")
-
-        if self.nodes:
-            self._save_results()
-        else:
-            logger.warning("结果为空，未生成文件")
+        # 1. 启动下载消费者线程
+        logger.info(f"启动 {DOWNLOAD_WORKERS} 个下载线程...")
+        threads = []
+        for _ in range(DOWNLOAD_WORKERS):
+            t = threading.Thread(target=self.fetch_worker)
+            t.daemon = True # 守护线程
+            t.start()
+            threads.append(t)
+        
+        # 2. 在主线程运行搜索生产者
+        try:
+            self.search_producer()
+        except KeyboardInterrupt:
+            logger.warning("用户中断")
+            self.should_stop = True
+        
+        # 3. 等待队列清空
+        logger.info("搜索结束，等待剩余下载任务完成(最多30秒)...")
+        timeout_wait = time.time() + 30
+        while not self.url_queue.empty() and time.time() < timeout_wait:
+            time.sleep(1)
+        
+        self.should_stop = True # 通知所有线程退出
+        
+        # 4. 保存结果
+        self._save_results()
 
     def _save_results(self):
-        """保存结果到文件"""
+        logger.info(f"=== 最终统计: 共获取 {len(self.nodes)} 个唯一节点 ===")
+        if not self.nodes:
+            logger.warning("结果为空，未生成文件")
+            return
+
         plain_text = "\n".join(self.nodes)
         
         # 保存明文
@@ -390,17 +379,16 @@ class NodeAggregator:
         except Exception as e:
             logger.error(f"保存明文失败: {e}")
 
-        # 保存 Base64 编码
+        # 保存 Base64
         try:
             b64_content = base64.b64encode(plain_text.encode('utf-8')).decode('utf-8')
             with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
                 f.write(b64_content)
-            logger.info(f"结果已保存至 {OUTPUT_FILE}")
+            logger.info(f"结果已保存至 {OUTPUT_FILE} 和 {RAW_OUTPUT_FILE}")
         except Exception as e:
             logger.error(f"保存 Base64 失败: {e}")
 
 if __name__ == "__main__":
-    # 获取环境变量中的 Token
     token = os.environ.get("GH_TOKEN")
     aggregator = NodeAggregator(token)
     aggregator.run()
