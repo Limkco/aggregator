@@ -11,61 +11,85 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # --- 第一阶段：下载与聚合 ---
+  fetch_raw:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout Code
-      # [激进模式] 使用 main 分支，获取插件的最新开发代码
       uses: actions/checkout@main
 
-    # 1. 动态生成 requirements.txt
-    # 这里我们同时写入 requests 和 PyYAML，确保脚本能解析 YAML/JSON 配置
-    - name: Generate requirements.txt
-      run: |
-        echo "requests" > requirements.txt
-        echo "PyYAML" >> requirements.txt
-
-    # 2. 设置 Python 为全网最新
     - name: Set up Python
-      # [激进模式] 使用 main 分支的 setup-python 插件
       uses: actions/setup-python@main
       with:
-        # [激进模式] 'x' 代表任意最新版本 (自动匹配 3.13, 3.14, 甚至未来的 4.0)
         python-version: 'x'
-        # 强制检查是否有新版本发布，而不是用缓存的旧版
         check-latest: true
-        cache: 'pip' # 开启 pip 缓存
+        cache: 'pip'
 
-    # 3. 安装依赖
-    # pip 会安装 requests 和 PyYAML
     - name: Install Dependencies
       run: |
-        pip install -r requirements.txt
+        pip install requests PyYAML
 
     - name: Run Aggregator Script
       env:
-        # 使用 GitHub Action 默认 Token
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         python aggregator.py
 
-    # 运行节点存活检测脚本
-    # 注意：此脚本需要在 aggregator.py 生成 nodes.txt 之后运行
+    # 1. 提交原始节点 (符合您的要求：聚合完成后提交到 nodes.txt)
+    - name: Commit Raw Nodes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add nodes.txt
+        # 如果没有新节点变化，忽略错误不退出
+        git commit -m "Update raw nodes [$(date)]" || exit 0
+        git push
+
+    # 2. 上传工件 (确保下一个 Job 能精准拿到这份数据，不用依赖 git checkout)
+    - name: Upload Raw Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: raw-nodes
+        path: nodes.txt
+        retention-days: 1
+
+  # --- 第二阶段：测试与清洗 ---
+  check_active:
+    needs: fetch_raw # 必须等待下载任务完成
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@main
+
+    - name: Set up Python
+      uses: actions/setup-python@main
+      with:
+        python-version: 'x'
+        check-latest: true
+        # check_active.py 使用标准库，无需额外 pip install，但为了环境统一保持配置
+
+    # 3. 下载上一步生成的原始节点
+    - name: Download Raw Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: raw-nodes
+        # 默认下载到当前目录，会覆盖 checkout 下来的 nodes.txt
+
     - name: Run Check Active Script
       run: |
+        # 读取 nodes.txt (脏数据)，生成 nodes.txt (清洗后) 和 sub.txt
         python check_active.py
 
-    - name: Commit and Push Changes
+    - name: Commit Final Results
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         
-        # 添加生成的文件 (这两个文件会被 check_active.py 更新)
         git add sub.txt nodes.txt
         
-        # 提交更改 (如果没有变化则跳过，避免报错)
-        git commit -m "Auto-update proxy nodes [$(date)]" || exit 0
+        # [关键步骤] 因为 fetch_raw 刚刚推送了代码，远程仓库已经更新。
+        # 这里必须先拉取合并，否则 push 会失败。
+        git pull --rebase
         
-        # 推送
+        git commit -m "Auto-update proxy nodes [$(date)]" || exit 0
         git push
