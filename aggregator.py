@@ -18,7 +18,7 @@ except ImportError:
     yaml = None
 
 # --- 配置部分 ---
-KEYWORDS = ["vmess", "vless", "ss", "trojan", "hysteria2", "clash", "sub", "节点", "翻墙", "proxies", "v2ray", "hy", "shadowsocks"]
+KEYWORDS = ["vmess", "vless", "sock", "trojan", "shadowsocks", "hysteria", "hysteria2", "hy", "hy2", "clash", "sub", "上网节点", "proxies", "v2ray", "翻墙节点", "机场节点"]
 # [修复] 移除空字符串，保留有效扩展名
 EXTENSIONS = ["yaml", "txt", "conf", "json"] 
 MAX_PAGES = 1
