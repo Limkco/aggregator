@@ -26,7 +26,7 @@ KEYWORDS: List[str] = [
     "sub", "上网节点", "proxies", "v2ray", "翻墙节点", "机场节点"
 ]
 
-EXTENSIONS: List[str] = ["yaml", "txt", "conf", "json"]
+EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
 MAX_PAGES: int = 1
 CONCURRENCY: int = 5
 TIMEOUT: int = 10
