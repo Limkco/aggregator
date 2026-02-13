@@ -23,7 +23,7 @@ jobs:
       with:
         python-version: 'x'
         check-latest: true
-        cache: 'pip'
+        # 移除了 cache: 'pip' 以修复 "No file matched" 错误
 
     - name: Install Dependencies
       run: |
@@ -35,7 +35,7 @@ jobs:
       run: |
         python aggregator.py
 
-    # 1. 提交原始节点 (符合您的要求：聚合完成后提交到 nodes.txt)
+    # 1. 提交原始节点 (聚合完成后提交到 nodes.txt)
     - name: Commit Raw Nodes
       run: |
         git config --local user.email "action@github.com"
@@ -45,7 +45,7 @@ jobs:
         git commit -m "Update raw nodes [$(date)]" || exit 0
         git push
 
-    # 2. 上传工件 (确保下一个 Job 能精准拿到这份数据，不用依赖 git checkout)
+    # 2. 上传工件 (确保下一个 Job 能精准拿到这份数据)
     - name: Upload Raw Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -66,7 +66,6 @@ jobs:
       with:
         python-version: 'x'
         check-latest: true
-        # check_active.py 使用标准库，无需额外 pip install，但为了环境统一保持配置
 
     # 3. 下载上一步生成的原始节点
     - name: Download Raw Artifact
