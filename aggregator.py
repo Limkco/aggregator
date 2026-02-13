@@ -27,7 +27,7 @@ KEYWORDS: List[str] = [
 ]
 
 EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
-MAX_PAGES: int = 1
+MAX_PAGES: int = 3
 CONCURRENCY: int = 5
 TIMEOUT: int = 10
 MAX_EXECUTION_TIME: int = 600  # 10分钟
