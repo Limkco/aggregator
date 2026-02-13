@@ -8,7 +8,7 @@ import logging
 import threading
 import queue
 from urllib.parse import quote
-from typing import List, Set, Dict, Any, Optional, Tuple, Union
+from typing import List, Set, Dict, Any, Optional, Union
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -31,10 +31,11 @@ KEYWORDS: List[str] = [
 # 扩展名配置：增加 yml
 EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
 
-MAX_PAGES: int = 5           # 搜索页数增加到5页，获取更多结果
-SEARCH_INTERVAL: float = 2.0 # 两次搜索请求的最小间隔(秒)
+MAX_PAGES: int = 5            # 搜索页数
+SEARCH_INTERVAL: float = 2.0  # 搜索请求间隔(秒)
 MAX_EXECUTION_TIME: int = 600 # 最大运行时间 10分钟
-DOWNLOAD_WORKERS: int = 20   # 下载解析线程数 (增加并发以处理更多文件)
+TIMEOUT: int = 10             # 下载超时时间(秒)
+DOWNLOAD_WORKERS: int = 20    # 下载解析线程数 (并发度)
 
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
@@ -114,7 +115,7 @@ class NodeAggregator:
         except Exception:
             return None
 
-    # --- [完整保留] 节点构建逻辑 ---
+    # --- 节点解析与构建逻辑 (完整保留) ---
 
     def _build_vmess_link(self, config: Dict[str, Any]) -> Optional[str]:
         try:
@@ -197,7 +198,7 @@ class NodeAggregator:
                 extracted.append(link)
         return extracted
 
-    # --- [完整保留] 提取核心逻辑 ---
+    # --- 核心提取逻辑 (完整保留) ---
 
     def extract_nodes(self, text: str) -> List[str]:
         if not text:
@@ -239,7 +240,7 @@ class NodeAggregator:
             
         return found_nodes
 
-    # --- [架构更新] 生产者-消费者逻辑 ---
+    # --- 生产者-消费者并发架构 ---
 
     def fetch_worker(self):
         """消费者线程：从队列获取URL并下载解析"""
@@ -251,7 +252,8 @@ class NodeAggregator:
                 continue
             
             try:
-                resp = self.session.get(url, timeout=10)
+                # 使用全局 TIMEOUT 常量
+                resp = self.session.get(url, timeout=TIMEOUT)
                 if resp.status_code == 200:
                     # 调用完整的提取逻辑
                     nodes = self.extract_nodes(resp.text)
@@ -260,7 +262,7 @@ class NodeAggregator:
                             count_before = len(self.nodes)
                             for node in nodes:
                                 self.nodes.add(node)
-                            # 简单的进度展示
+                            # 进度日志
                             if len(self.nodes) > count_before and len(self.nodes) % 50 == 0:
                                 logger.info(f"当前库存: {len(self.nodes)} 个唯一节点")
             except Exception:
@@ -279,7 +281,7 @@ class NodeAggregator:
             for ext in EXTENSIONS:
                 if self.should_stop: break
                 
-                # 智能跳过：如果第一页都没结果，通常后面也没有
+                # 标记：当前关键词+后缀组合是否找到了结果
                 found_items_in_this_combo = False
                 
                 for page in range(1, MAX_PAGES + 1):
@@ -290,7 +292,6 @@ class NodeAggregator:
                         return
 
                     query = f"{keyword} extension:{ext}"
-                    # 排序使用 indexed desc (最近索引)
                     api_url = f"https://api.github.com/search/code?q={query}&per_page=20&page={page}&sort=indexed&order=desc"
                     
                     try:
@@ -307,8 +308,7 @@ class NodeAggregator:
                             logger.info(f"搜索 [{query} P{page}] -> 找到 {len(items)} 个文件")
                             
                             if not items:
-                                # 当前页无结果，停止翻页
-                                break
+                                break # 当前页无结果，停止翻页
                             
                             found_items_in_this_combo = True
                             
