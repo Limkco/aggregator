@@ -56,6 +56,7 @@ class NodeAggregator:
         self.nodes: Set[str] = set()
         self.nodes_lock = threading.Lock() # 线程锁，保护集合写入
         
+        # 初始化 Session (包含连接池优化)
         self.session = self._init_session()
         self._setup_headers()
         
@@ -76,6 +77,7 @@ class NodeAggregator:
             logger.warning("未检测到 PyYAML 库，YAML 解析功能将不可用。建议安装 PyYAML。")
 
     def _init_session(self) -> requests.Session:
+        """初始化 Session，优化连接池以消除警告并提升性能"""
         session = requests.Session()
         retry = Retry(
             total=3,
@@ -83,7 +85,12 @@ class NodeAggregator:
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["GET"]
         )
-        adapter = HTTPAdapter(max_retries=retry)
+        # [关键优化] 设置连接池大小 = 下载线程数
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=DOWNLOAD_WORKERS, 
+            pool_maxsize=DOWNLOAD_WORKERS
+        )
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
@@ -330,9 +337,8 @@ class NodeAggregator:
                         logger.error(f"搜索请求异常: {e}")
                         time.sleep(5)
                 
-                # 如果第一页就没结果，不需要继续翻页，也不需要继续搜这个后缀的其他组合（视情况而定，这里简化处理）
-                if not found_items_in_this_combo:
-                    pass 
+                # 如果第一页就没结果，跳过此组合的后续复杂逻辑（已由 break 实现翻页跳过）
+                pass 
 
         logger.info("所有搜索任务已遍历完成")
 
