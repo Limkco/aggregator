@@ -296,6 +296,8 @@ class NodeAggregator:
         logger.info(f"开始搜索 GitHub, 关键词队列: {len(KEYWORDS)} 个")
         random.shuffle(KEYWORDS) # 打乱顺序
         
+        consecutive_limit_hits = 0 # 新增：连续风控计数器
+
         for keyword in KEYWORDS:
             if self.should_stop: break
             
@@ -325,12 +327,20 @@ class NodeAggregator:
                             
                             # 触发速率限制：原地等待并重试，绝不跳过
                             if resp.status_code in [403, 429]:
+                                consecutive_limit_hits += 1 # 计数 +1
+                                
+                                # 新增：连续4次风控则熔断
+                                if consecutive_limit_hits >= 4:
+                                    logger.warning("连续 4 次触发 API 速率限制，判定为高风险，停止搜索任务并进入后续处理...")
+                                    return 
+
                                 wait_time = 60 * (attempt + 1) # 第一次60s，第二次120s
                                 logger.warning(f"触发 API 速率限制，暂停 {wait_time} 秒后重试 (第 {attempt+1} 次)...")
                                 time.sleep(wait_time)
                                 continue 
                             
                             if resp.status_code == 200:
+                                consecutive_limit_hits = 0 # 成功则重置计数
                                 items = resp.json().get("items", [])
                                 logger.info(f"搜索 [{query} P{page}] -> 找到 {len(items)} 个文件")
                                 
