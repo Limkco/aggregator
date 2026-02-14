@@ -58,6 +58,9 @@ class NodeParser:
                 try:
                     b64_str = link[8:]
                     json_str = NodeParser.safe_base64_decode(b64_str)
+                    if not json_str: 
+                        return None, None, None, False
+                        
                     conf = json.loads(json_str)
                     host = conf.get("add")
                     port = conf.get("port")
@@ -81,7 +84,7 @@ class NodeParser:
                         h, p = part_host.split(':')
                         host = h
                         port = int(p)
-                    # 普通 SS 默认无 TLS，除非你有特定识别 plugin 的逻辑，否则这里 is_tls 为 False
+                    # 普通 SS 默认无 TLS
                 except: pass
 
             # --- 3. URL Schema (Trojan, VLESS, Hysteria2) ---
@@ -129,6 +132,11 @@ async def check_connectivity(link, semaphore):
         return None
     if not host or not port:
         return None
+
+    # [优化] 健壮性修复：如果启用 TLS 但未解析到 SNI，回退使用 Host
+    # 这一步能挽救大量配置不规范但实际可用的节点
+    if is_tls and not sni:
+        sni = host
 
     async with semaphore:
         writer = None
