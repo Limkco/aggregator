@@ -2,13 +2,16 @@ name: Aggregator Daily Build
 
 on:
   schedule:
+    # 每天 UTC 时间 0:00 运行 (北京时间 8:00)
     - cron: '0 0 */3 * *'
   workflow_dispatch:
+    # 允许手动触发
 
 permissions:
   contents: write
 
 jobs:
+  # --- 第一阶段：下载与聚合 ---
   fetch_raw:
     runs-on: ubuntu-latest
     steps:
@@ -18,28 +21,33 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@main
       with:
-        python-version: '3.10' # 推荐 3.10 以兼容 ddg 和 curl_cffi
+        # 强制指定 Python 3.10，确保依赖库兼容性
+        python-version: '3.10'
         check-latest: true
 
     - name: Install Dependencies
       run: |
-        # [新增] duckduckgo_search 用于搜索，curl_cffi 用于下载
-        pip install requests PyYAML curl_cffi duckduckgo_search
+        # [核心修复点] 这里必须包含 curl_cffi 和 duckduckgo_search
+        pip install requests PyYAML curl_cffi duckduckgo-search
 
     - name: Run Aggregator Script
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 虽然不用API搜索，但可能用于其他用途，保留无妨
+        # 虽然不用 API 搜索，但保留 Token 以防万一
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         python aggregator.py
 
+    # 1. 提交原始节点 (聚合完成后提交到 nodes.txt)
     - name: Commit Raw Nodes
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git add nodes.txt
+        # 如果没有新节点变化，忽略错误不退出
         git commit -m "Update raw nodes [$(date)]" || exit 0
         git push
 
+    # 2. 上传工件 (确保下一个 Job 能精准拿到这份数据)
     - name: Upload Raw Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -47,8 +55,9 @@ jobs:
         path: nodes.txt
         retention-days: 1
 
+  # --- 第二阶段：测试与清洗 ---
   check_active:
-    needs: fetch_raw
+    needs: fetch_raw # 必须等待下载任务完成
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
@@ -60,19 +69,34 @@ jobs:
         python-version: '3.10'
         check-latest: true
 
+    # 3. 下载上一步生成的原始节点
     - name: Download Raw Artifact
       uses: actions/download-artifact@v4
       with:
         name: raw-nodes
+        # 默认下载到当前目录，会覆盖 checkout 下来的 nodes.txt
+
+    - name: Install Dependencies for Check
+      run: |
+        # check_active.py 也需要 requests
+        pip install requests
 
     - name: Run Check Active Script
       run: |
+        # 读取 nodes.txt (脏数据)，生成 nodes.txt (清洗后) 和 sub.txt
         python check_active.py
 
     - name: Commit Final Results
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
+        
+        # 1. 暂存当前测试后的最终结果
         git add sub.txt nodes.txt
+        
+        # 2. 提交到本地
         git commit -m "Auto-update proxy nodes [$(date)]" || exit 0
+        
+        # 3. 强制推送到远程分支
+        # 使用 --force 覆盖 fetch_raw 产生的中间提交。
         git push --force origin main
