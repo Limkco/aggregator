@@ -69,9 +69,9 @@ jobs:
     # --- [条件执行] 仅在 skip_crawl != 'true' 时才配置 Python 和执行爬取 ---
     - name: Set up Python
       if: steps.check_artifact.outputs.skip_crawl != 'true'
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@main
       with:
-        python-version: '3.11'
+        python-version: 'x'
 
     - name: Install Dependencies
       if: steps.check_artifact.outputs.skip_crawl != 'true'
@@ -89,7 +89,7 @@ jobs:
     # 无论 nodes.txt 是刚刚通过 aggregator.py 爬取的，还是通过 gh CLI 从历史记录中恢复的，
     # 都将其挂载为本次运行（Current Run）的新工件，以确保 Job 2 可以毫无阻碍地下载它。
     - name: Upload Raw Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@main
       with:
         name: raw-nodes
         path: nodes.txt
@@ -102,16 +102,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v4
+      uses: actions/checkout@main
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@main
       with:
-        python-version: '3.11'
+        python-version: 'x'
 
     # 从当前运行（Current Run）的第一阶段下载工件
     - name: Download Raw Artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@main
       with:
         name: raw-nodes
 
