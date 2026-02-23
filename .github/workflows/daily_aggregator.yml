@@ -119,7 +119,7 @@ jobs:
       run: |
         pip install maxminddb
         # 下载免费开源的 MaxMind IP 地理库 (上一步附加功能 A 的依赖)
-        wget -qO geoip.mmdb "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/geoip.mmdb"
+        wget -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"
 
     - name: Run Check Active Script
       run: |
