@@ -7,7 +7,31 @@ import asyncio
 import ssl
 import time
 import logging
-from urllib.parse import urlparse, parse_qs, unquote
+import socket # [新增] 用于 DNS 解析
+from urllib.parse import urlparse, parse_qs, unquote, quote # [新增] 引入 quote 用于 URL 编码
+
+# --- [新增] 优化项 3: 严格版本兼容性断言 ---
+assert sys.version_info >= (3, 11), "SSL 检测要求 Python 3.11+"
+
+# --- [新增] 附加功能 A: GeoIP 数据库初始化 ---
+try:
+    import maxminddb
+    GEO_DB_PATH = "geoip.mmdb"
+    geo_reader = maxminddb.open_database(GEO_DB_PATH) if os.path.exists(GEO_DB_PATH) else None
+except ImportError:
+    geo_reader = None
+
+def get_country_code(host: str) -> str:
+    """[新增] 根据主机域名或 IP 解析国家地区代码"""
+    if not geo_reader: return "UNK"
+    try:
+        ip = socket.gethostbyname(host)
+        res = geo_reader.get(ip)
+        if res and 'country' in res:
+            return res['country']['iso_code']
+    except Exception:
+        pass
+    return "UNK"
 
 # --- 配置部分 ---
 INPUT_FILE = "nodes.txt"       # 聚合生成的原始节点文件
@@ -167,8 +191,23 @@ async def check_connectivity(link, semaphore):
             try: await writer.wait_closed()
             except: pass
             
-            # 返回结果
-            return (link, total_latency, f"{host}:{port}")
+            # --- [新增] 附加功能 A：查询地理位置并格式化重命名节点 ---
+            cc = get_country_code(host)
+            new_remark = f"[{cc}] {total_latency:.0f}ms"
+            
+            new_link = link
+            if link.startswith("vmess://"):
+                try:
+                    conf = json.loads(NodeParser.safe_base64_decode(link[8:]))
+                    conf["ps"] = new_remark
+                    new_link = "vmess://" + base64.b64encode(json.dumps(conf, separators=(',', ':')).encode('utf-8')).decode('utf-8')
+                except Exception:
+                    new_link = link.split("#")[0] + "#" + quote(new_remark)
+            else:
+                new_link = link.split("#")[0] + "#" + quote(new_remark)
+
+            # 返回结果 (返回带地区和延迟的新链接)
+            return (new_link, total_latency, f"{host}:{port}")
 
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError, ssl.SSLError):
             # 任何阶段失败 (TCP连不上 或 SSL握手失败) 都视为无效
@@ -179,7 +218,9 @@ async def check_connectivity(link, semaphore):
                     # await writer.wait_closed() 
                 except: pass
             return None
-        except Exception:
+        except Exception as e:
+            # --- [修改] 优化项 2: 消除吞没异常风险，改为安全的日志记录 ---
+            logger.debug(f"节点检测发生内部异常 {host}:{port} - {type(e).__name__}: {str(e)}")
             if writer:
                 try: writer.close()
                 except: pass

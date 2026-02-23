@@ -7,6 +7,7 @@ import random
 import logging
 import threading
 import queue
+import hashlib # [新增] 用于特征哈希计算
 from urllib.parse import quote
 from typing import List, Set, Dict, Any, Optional, Union
 
@@ -55,6 +56,7 @@ class NodeAggregator:
     def __init__(self, token: Optional[str]):
         self.github_token = token
         self.nodes: Set[str] = set()
+        self.seen_hashes: Set[str] = set() # [新增] 用于特征值去重的哈希集合
         self.nodes_lock = threading.Lock() # 线程锁，保护集合写入安全
         
         # 初始化 Session (包含连接池优化)
@@ -125,6 +127,32 @@ class NodeAggregator:
             return base64.b64decode(text).decode('utf-8', errors='ignore')
         except Exception:
             return None
+
+    # --- [新增] 核心特征值生成（优化项 1：去重逻辑） ---
+    def _get_node_hash(self, link: str) -> str:
+        """剥离名称备注等冗余信息，仅对节点的核心连接参数进行哈希"""
+        link = link.strip()
+        if "://" not in link:
+            return hashlib.md5(link.encode('utf-8')).hexdigest()
+        
+        try:
+            protocol, rest = link.split("://", 1)
+            protocol = protocol.lower()
+            
+            # vmess 需要解密 base64 后剔除 'ps' (备注) 字段
+            if protocol == "vmess":
+                decoded = self.safe_base64_decode(rest)
+                if decoded:
+                    conf = json.loads(decoded)
+                    conf.pop("ps", None) 
+                    conf_str = json.dumps(conf, sort_keys=True)
+                    return hashlib.md5(f"vmess://{conf_str}".encode('utf-8')).hexdigest()
+            
+            # 其他协议直接去除 # 后面的备注信息
+            core = rest.split("#")[0]
+            return hashlib.md5(f"{protocol}://{core}".encode('utf-8')).hexdigest()
+        except Exception:
+            return hashlib.md5(link.encode('utf-8')).hexdigest()
 
     # --- [完整保留] 节点构建逻辑 ---
 
@@ -282,7 +310,11 @@ class NodeAggregator:
                         with self.nodes_lock:
                             count_before = len(self.nodes)
                             for node in nodes:
-                                self.nodes.add(node)
+                                # [核心改动：应用哈希去重逻辑]
+                                node_hash = self._get_node_hash(node)
+                                if node_hash not in self.seen_hashes:
+                                    self.seen_hashes.add(node_hash)
+                                    self.nodes.add(node)
                             # 简单的进度展示
                             if len(self.nodes) > count_before and len(self.nodes) % 50 == 0:
                                 logger.info(f"当前库存: {len(self.nodes)} 个唯一节点")
