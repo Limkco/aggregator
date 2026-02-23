@@ -2,74 +2,129 @@ name: Aggregator Daily Build
 
 on:
   schedule:
+    # 每5天 UTC 时间 0:00 运行 (北京时间 8:00)
     - cron: '0 0 */5 * *'
   workflow_dispatch:
+    # 允许手动触发，并加入一个强制爬取的选项以备不时之需
+    inputs:
+      force_crawl:
+        description: '强制重新爬取 (无视已存在的 raw-nodes)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: read # [新增核心权限] 必须授予此权限，工作流才能使用 gh CLI 读取历史运行记录和下载跨运行工件
 
 jobs:
   # --- 第一阶段：下载与聚合 ---
   fetch_raw:
     runs-on: ubuntu-latest
+    # 将跨步骤的判断结果暴露给该 Job 的 outputs，方便后续步骤做级联拦截
+    outputs:
+      skip_crawl: ${{ steps.check_artifact.outputs.skip_crawl }}
     steps:
     - name: Checkout Code
-      uses: actions/checkout@main
+      uses: actions/checkout@v4
 
+    # --- [新增核心逻辑] 检查并恢复尚未过期的 raw-nodes ---
+    - name: Check and Restore Existing raw-nodes
+      id: check_artifact
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # 1. 检查用户是否在手动触发时开启了强制重爬
+        if [ "${{ github.event.inputs.force_crawl }}" == "true" ]; then
+          echo "用户选择了强制重新爬取，跳过工件检查。"
+          echo "skip_crawl=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "正在检查历史记录中尚未过期的 'raw-nodes'..."
+        
+        # 2. 动态获取当前工作流的文件名，确保重命名文件后依然可用
+        WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" | cut -d'@' -f1)
+        
+        # 3. 使用 GitHub CLI 获取上一次执行的 RUN_ID
+        # 严谨处理：必须排除当前正在运行的 ID (${{ github.run_id }})，否则会因为查到自己而导致工件下载失败
+        PREV_RUN_ID=$(gh run list --workflow "$WORKFLOW_FILE" --json databaseId --jq '[.[] | select(.databaseId != '${{ github.run_id }}')] | .[0].databaseId // empty' || echo "")
+        
+        # 4. 尝试跨运行下载工件
+        if [ -n "$PREV_RUN_ID" ]; then
+          echo "找到上一次历史运行 ID: $PREV_RUN_ID"
+          # 如果工件未过期（retention-days: 1 内），此命令将成功把 nodes.txt 下载到当前目录
+          if gh run download "$PREV_RUN_ID" -n raw-nodes --dir .; then
+            echo "成功下载未过期的 raw-nodes，将跳过本轮节点爬取！"
+            echo "skip_crawl=true" >> $GITHUB_OUTPUT
+          else
+            echo "上一次运行的 raw-nodes 已过期被清理或不存在，需要重新爬取。"
+            echo "skip_crawl=false" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "未找到任何历史运行记录，需要重新爬取。"
+          echo "skip_crawl=false" >> $GITHUB_OUTPUT
+        fi
+
+    # --- [条件执行] 仅在 skip_crawl != 'true' 时才配置 Python 和执行爬取 ---
     - name: Set up Python
-      uses: actions/setup-python@main
+      if: steps.check_artifact.outputs.skip_crawl != 'true'
+      uses: actions/setup-python@v5
       with:
-        python-version: 'x' # 强制要求 3.11 以上版本以完美兼容 SSL start_tls 机制
+        python-version: '3.11'
 
     - name: Install Dependencies
+      if: steps.check_artifact.outputs.skip_crawl != 'true'
       run: |
         pip install requests PyYAML
 
     - name: Run Aggregator Script
+      if: steps.check_artifact.outputs.skip_crawl != 'true'
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         python aggregator.py
 
-    # 修改：不再将含有数千废弃节点的脏数据 push 到当前代码分支污染版本树
-    # 仅将其作为跨 Job 工件流转，最大程度保持仓库体积轻盈
+    # --- [无缝衔接] 上传工件 ---
+    # 无论 nodes.txt 是刚刚通过 aggregator.py 爬取的，还是通过 gh CLI 从历史记录中恢复的，
+    # 都将其挂载为本次运行（Current Run）的新工件，以确保 Job 2 可以毫无阻碍地下载它。
     - name: Upload Raw Artifact
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v4
       with:
         name: raw-nodes
         path: nodes.txt
         retention-days: 1
+        overwrite: true
 
-  # --- 第二阶段：测试、清洗与发布 ---
+  # --- 第二阶段：测试与清洗 ---
   check_active:
-    needs: fetch_raw 
+    needs: fetch_raw # 必须等待第一阶段任务完成并抛出工件
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
-      uses: actions/checkout@main
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@main
+      uses: actions/setup-python@v5
       with:
-        python-version: 'x'
+        python-version: '3.11'
 
+    # 从当前运行（Current Run）的第一阶段下载工件
     - name: Download Raw Artifact
-      uses: actions/download-artifact@main
+      uses: actions/download-artifact@v4
       with:
         name: raw-nodes
 
     - name: Install Environment & Download GeoIP Database
       run: |
         pip install maxminddb
-        # 下载免费开源的 MaxMind IP 地理库
+        # 下载免费开源的 MaxMind IP 地理库 (上一步附加功能 A 的依赖)
         wget -qO geoip.mmdb "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/geoip.mmdb"
 
     - name: Run Check Active Script
       run: |
         python check_active.py
 
-    # 附加功能 D：工作流瘦身发布
-    # 将最终产出的节点单独发布到 'release' 孤立分支，用户只需订阅 https://raw.github.../release/sub.txt
     - name: Publish to Release Branch
       run: |
         # 将成品放入独立发布池
@@ -86,5 +141,5 @@ jobs:
         git add .
         git commit -m "Auto-update valid nodes [$(date)]" || exit 0
         
-        # 强制推送到仓库的 release 分支，实现轻量化订阅发布
+        # 强制推送到仓库的 release 分支，实现轻量化订阅发布 (上一步附加功能 D 的实现)
         git push --force "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" release
