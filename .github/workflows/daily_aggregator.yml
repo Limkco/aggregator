@@ -15,26 +15,23 @@ on:
 
 permissions:
   contents: write
-  actions: read # [新增核心权限] 必须授予此权限，工作流才能使用 gh CLI 读取历史运行记录和下载跨运行工件
+  actions: read # 必须授予此权限，工作流才能使用 gh CLI 读取历史运行记录和下载跨运行工件
 
 jobs:
   # --- 第一阶段：下载与聚合 ---
   fetch_raw:
     runs-on: ubuntu-latest
-    # 将跨步骤的判断结果暴露给该 Job 的 outputs，方便后续步骤做级联拦截
     outputs:
       skip_crawl: ${{ steps.check_artifact.outputs.skip_crawl }}
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # --- [新增核心逻辑] 检查并恢复尚未过期的 raw-nodes ---
     - name: Check and Restore Existing raw-nodes
       id: check_artifact
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # 1. 检查用户是否在手动触发时开启了强制重爬
         if [ "${{ github.event.inputs.force_crawl }}" == "true" ]; then
           echo "用户选择了强制重新爬取，跳过工件检查。"
           echo "skip_crawl=false" >> $GITHUB_OUTPUT
@@ -42,18 +39,13 @@ jobs:
         fi
 
         echo "正在检查历史记录中尚未过期的 'raw-nodes'..."
-        
-        # 2. 动态获取当前工作流的文件名，确保重命名文件后依然可用
         WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" | cut -d'@' -f1)
         
-        # 3. 使用 GitHub CLI 获取上一次执行的 RUN_ID
-        # 严谨处理：必须排除当前正在运行的 ID (${{ github.run_id }})，否则会因为查到自己而导致工件下载失败
+        # 排除当前正在运行的 ID，抓取上一次成功保存的 raw-nodes
         PREV_RUN_ID=$(gh run list --workflow "$WORKFLOW_FILE" --json databaseId --jq '[.[] | select(.databaseId != '${{ github.run_id }}')] | .[0].databaseId // empty' || echo "")
         
-        # 4. 尝试跨运行下载工件
         if [ -n "$PREV_RUN_ID" ]; then
           echo "找到上一次历史运行 ID: $PREV_RUN_ID"
-          # 如果工件未过期（retention-days: 1 内），此命令将成功把 nodes.txt 下载到当前目录
           if gh run download "$PREV_RUN_ID" -n raw-nodes --dir .; then
             echo "成功下载未过期的 raw-nodes，将跳过本轮节点爬取！"
             echo "skip_crawl=true" >> $GITHUB_OUTPUT
@@ -66,12 +58,11 @@ jobs:
           echo "skip_crawl=false" >> $GITHUB_OUTPUT
         fi
 
-    # --- [条件执行] 仅在 skip_crawl != 'true' 时才配置 Python 和执行爬取 ---
     - name: Set up Python
       if: steps.check_artifact.outputs.skip_crawl != 'true'
-      uses: actions/setup-python@main
+      uses: actions/setup-python@v5
       with:
-        python-version: 'x'
+        python-version: '3.11'
 
     - name: Install Dependencies
       if: steps.check_artifact.outputs.skip_crawl != 'true'
@@ -85,11 +76,8 @@ jobs:
       run: |
         python aggregator.py
 
-    # --- [无缝衔接] 上传工件 ---
-    # 无论 nodes.txt 是刚刚通过 aggregator.py 爬取的，还是通过 gh CLI 从历史记录中恢复的，
-    # 都将其挂载为本次运行（Current Run）的新工件，以确保 Job 2 可以毫无阻碍地下载它。
     - name: Upload Raw Artifact
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v4
       with:
         name: raw-nodes
         path: nodes.txt
@@ -98,28 +86,40 @@ jobs:
 
   # --- 第二阶段：测试与清洗 ---
   check_active:
-    needs: fetch_raw # 必须等待第一阶段任务完成并抛出工件
+    needs: fetch_raw
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
-      uses: actions/checkout@main
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@main
+      uses: actions/setup-python@v5
       with:
-        python-version: 'x'
+        python-version: '3.11'
 
-    # 从当前运行（Current Run）的第一阶段下载工件
     - name: Download Raw Artifact
-      uses: actions/download-artifact@main
+      uses: actions/download-artifact@v4
       with:
         name: raw-nodes
 
-    - name: Install Environment & Download GeoIP Database
+    # --- [核心修改] 加入本地回退逻辑 ---
+    - name: Install Environment & Prepare GeoIP Database
       run: |
         pip install maxminddb
-        # 下载免费开源的 MaxMind IP 地理库 (上一步附加功能 A 的依赖)
-        wget -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"
+        
+        echo "尝试下载最新的 GeoLite2-Country 数据库..."
+        # 设置了 15 秒超时 (-T 15)，防止网络卡死
+        if wget -T 15 -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
+          echo "✅ 成功下载并部署最新的 GeoIP 数据库。"
+        else
+          echo "⚠️ 下载最新 GeoIP 数据库失败，开始启用本地回退策略！"
+          if [ -f "GeoLite2-Country.mmdb" ]; then
+            cp GeoLite2-Country.mmdb geoip.mmdb
+            echo "✅ 成功拷贝本地 GeoLite2-Country.mmdb 用于节点测速重命名。"
+          else
+            echo "❌ 错误：本地也未找到 GeoLite2-Country.mmdb，测速程序可能无法提供地理位置。"
+          fi
+        fi
 
     - name: Run Check Active Script
       run: |
@@ -127,7 +127,6 @@ jobs:
 
     - name: Publish to Release Branch
       run: |
-        # 将成品放入独立发布池
         mkdir -p publish_dir
         cp sub.txt publish_dir/
         cp nodes.txt publish_dir/
@@ -141,5 +140,4 @@ jobs:
         git add .
         git commit -m "Auto-update valid nodes [$(date)]" || exit 0
         
-        # 强制推送到仓库的 release 分支，实现轻量化订阅发布 (上一步附加功能 D 的实现)
         git push --force "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" release
