@@ -2,10 +2,8 @@ name: Aggregator Daily Build
 
 on:
   schedule:
-    # 每5天 UTC 时间 0:00 运行 (北京时间 8:00)
     - cron: '0 0 */5 * *'
   workflow_dispatch:
-    # 允许手动触发
 
 permissions:
   contents: write
@@ -21,9 +19,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@main
       with:
-        python-version: 'x'
-        check-latest: true
-        # 移除了 cache: 'pip' 以修复 "No file matched" 错误
+        python-version: 'x' # 强制要求 3.11 以上版本以完美兼容 SSL start_tls 机制
 
     - name: Install Dependencies
       run: |
@@ -35,17 +31,8 @@ jobs:
       run: |
         python aggregator.py
 
-    # 1. 提交原始节点 (聚合完成后提交到 nodes.txt)
-    - name: Commit Raw Nodes
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add nodes.txt
-        # 如果没有新节点变化，忽略错误不退出
-        git commit -m "Update raw nodes [$(date)]" || exit 0
-        git push
-
-    # 2. 上传工件 (确保下一个 Job 能精准拿到这份数据)
+    # 修改：不再将含有数千废弃节点的脏数据 push 到当前代码分支污染版本树
+    # 仅将其作为跨 Job 工件流转，最大程度保持仓库体积轻盈
     - name: Upload Raw Artifact
       uses: actions/upload-artifact@main
       with:
@@ -53,44 +40,51 @@ jobs:
         path: nodes.txt
         retention-days: 1
 
-  # --- 第二阶段：测试与清洗 ---
+  # --- 第二阶段：测试、清洗与发布 ---
   check_active:
-    needs: fetch_raw # 必须等待下载任务完成
+    needs: fetch_raw 
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
       uses: actions/checkout@main
 
     - name: Set up Python
-      uses: actions/setup-python@main
+      uses: actions/setup-python@vmain
       with:
         python-version: 'x'
-        check-latest: true
 
-    # 3. 下载上一步生成的原始节点
     - name: Download Raw Artifact
       uses: actions/download-artifact@main
       with:
         name: raw-nodes
-        # 默认下载到当前目录，会覆盖 checkout 下来的 nodes.txt
+
+    - name: Install Environment & Download GeoIP Database
+      run: |
+        pip install maxminddb
+        # 下载免费开源的 MaxMind IP 地理库
+        wget -qO geoip.mmdb "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/geoip.mmdb"
 
     - name: Run Check Active Script
       run: |
-        # 读取 nodes.txt (脏数据)，生成 nodes.txt (清洗后) 和 sub.txt
         python check_active.py
 
-    - name: Commit Final Results
+    # 附加功能 D：工作流瘦身发布
+    # 将最终产出的节点单独发布到 'release' 孤立分支，用户只需订阅 https://raw.github.../release/sub.txt
+    - name: Publish to Release Branch
       run: |
+        # 将成品放入独立发布池
+        mkdir -p publish_dir
+        cp sub.txt publish_dir/
+        cp nodes.txt publish_dir/
+        cd publish_dir
+        
+        git init
+        git checkout -b release
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         
-        # 1. 暂存当前测试后的最终结果
-        git add sub.txt nodes.txt
+        git add .
+        git commit -m "Auto-update valid nodes [$(date)]" || exit 0
         
-        # 2. 提交到本地
-        git commit -m "Auto-update proxy nodes [$(date)]" || exit 0
-        
-        # 3. 强制推送到远程分支
-        # 使用 --force 覆盖 fetch_raw 产生的中间提交。
-        # 这样可以避免 rebase 冲突，因为 Job 2 的结果本身就包含了 Job 1 的有效部分。
-        git push --force origin main
+        # 强制推送到仓库的 release 分支，实现轻量化订阅发布
+        git push --force "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" release
