@@ -38,6 +38,9 @@ INPUT_FILE = "nodes.txt"       # 聚合生成的原始节点文件
 OUTPUT_FILE = "nodes.txt"      # 清洗后的明文节点文件
 SUB_FILE = "sub.txt"           # Base64 订阅文件
 
+# [新增] 最大保留节点数量 (防止长期运行导致文件无限膨胀)
+MAX_NODES = 2000
+
 # 并发数 (根据网络情况调整)
 CONCURRENCY = 200              
 # 超时设置 (秒)
@@ -271,9 +274,10 @@ async def main():
     # 3. 排序 (延迟低优先)
     valid_nodes.sort(key=lambda x: x[1])
     
-    # 4. 保存
-    final_links = [x[0] for x in valid_nodes]
+    # --- [修改] 截取前 MAX_NODES 个最优节点，严格控制输出文件大小 ---
+    final_links = [x[0] for x in valid_nodes][:MAX_NODES]
     
+    # 4. 保存
     try:
         with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
             f.write("\n".join(final_links))
@@ -283,7 +287,7 @@ async def main():
             f.write(b64_content)
             
         print(f"筛选完成，耗时 {time.time() - start_time:.2f}s")
-        print(f"最终可用 TLS 节点: {len(final_links)}/{len(unique_nodes)}")
+        print(f"检测存活 TLS 节点: {len(valid_nodes)} 个，根据策略保留最优的 {len(final_links)} 个")
         if valid_nodes:
             print(f"最优节点延迟: {valid_nodes[0][1]:.2f}ms")
         print(f"结果已保存至 {OUTPUT_FILE}")
