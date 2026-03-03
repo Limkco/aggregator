@@ -5,7 +5,6 @@ on:
     # 每5天 UTC 时间 0:00 运行 (北京时间 8:00)
     - cron: '0 0 */5 * *'
   workflow_dispatch:
-    # 允许手动触发，并加入一个强制爬取的选项以备不时之需
     inputs:
       force_crawl:
         description: '强制重新爬取 (无视已存在的 raw-nodes)'
@@ -15,7 +14,7 @@ on:
 
 permissions:
   contents: write
-  actions: read # 必须授予此权限，工作流才能使用 gh CLI 读取历史运行记录和下载跨运行工件
+  actions: read # 必须授予此权限，工作流才能使用 gh CLI 读取历史运行记录
 
 jobs:
   # --- 第一阶段：下载与聚合 ---
@@ -25,7 +24,7 @@ jobs:
       skip_crawl: ${{ steps.check_artifact.outputs.skip_crawl }}
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v4
+      uses: actions/checkout@main
 
     - name: Check and Restore Existing raw-nodes
       id: check_artifact
@@ -40,8 +39,6 @@ jobs:
 
         echo "正在检查历史记录中尚未过期的 'raw-nodes'..."
         WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" | cut -d'@' -f1)
-        
-        # 排除当前正在运行的 ID，抓取上一次成功保存的 raw-nodes
         PREV_RUN_ID=$(gh run list --workflow "$WORKFLOW_FILE" --json databaseId --jq '[.[] | select(.databaseId != '${{ github.run_id }}')] | .[0].databaseId // empty' || echo "")
         
         if [ -n "$PREV_RUN_ID" ]; then
@@ -60,9 +57,9 @@ jobs:
 
     - name: Set up Python
       if: steps.check_artifact.outputs.skip_crawl != 'true'
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@main
       with:
-        python-version: '3.11'
+        python-version: 'x'
 
     - name: Install Dependencies
       if: steps.check_artifact.outputs.skip_crawl != 'true'
@@ -84,40 +81,87 @@ jobs:
         retention-days: 1
         overwrite: true
 
-  # --- 第二阶段：测试与清洗 ---
+  # --- 第二阶段：合并、清洗与测试 ---
   check_active:
     needs: fetch_raw
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v4
+      uses: actions/checkout@main
+      with:
+        fetch-depth: 0 
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@main
       with:
-        python-version: '3.11'
+        python-version: 'x'
 
     - name: Download Raw Artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@main
       with:
         name: raw-nodes
 
-    # --- [核心修改] 加入本地回退逻辑 ---
-    - name: Install Environment & Prepare GeoIP Database
+    # --- [新增] 合并历史节点 ---
+    - name: Fetch Previous Release Nodes & Merge
+      run: |
+        echo "尝试获取 release 分支上一轮的有效节点..."
+        # 直接通过 raw 链接下载上一轮的结果，如果这是第一次运行报 404 也不影响主流程
+        if wget -qO previous_nodes.txt "https://raw.githubusercontent.com/${{ github.repository }}/release/nodes.txt"; then
+          echo "✅ 成功获取上一轮节点！"
+          if [ -f "merge_nodes.py" ]; then
+            python merge_nodes.py
+            echo "✅ 历史节点与新节点合并去重完成。"
+          else
+            echo "⚠️ 未找到 merge_nodes.py 脚本，跳过合并步骤。"
+          fi
+        else
+          echo "ℹ️ 未找到上一轮节点文件 (可能是首次运行或 release 分支暂无数据)，跳过合并。"
+        fi
+
+    # --- [已存在] 关键字过滤阶段 ---
+    - name: Filter Nodes by Keywords
+      run: |
+        echo "开始执行关键字过滤..."
+        if [ -f "filter_nodes.py" ]; then
+          python filter_nodes.py
+          if [ -f "nodes_filtered.txt" ]; then
+            mv nodes_filtered.txt nodes.txt
+            echo "✅ 关键字过滤完成，已生成最新 nodes.txt"
+          fi
+        else
+          echo "⚠️ 未找到 filter_nodes.py 脚本，跳过关键字过滤阶段。"
+        fi
+
+    # --- 环境安装与测速 ---
+    - name: Install Environment & Update GeoIP Database
       run: |
         pip install maxminddb
         
         echo "尝试下载最新的 GeoLite2-Country 数据库..."
-        # 设置了 15 秒超时 (-T 15)，防止网络卡死
-        if wget -T 15 -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
-          echo "✅ 成功下载并部署最新的 GeoIP 数据库。"
+        if wget -T 15 -qO temp_GeoLite2.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
+          echo "✅ 成功下载最新的 GeoIP 数据库。"
+          mv temp_GeoLite2.mmdb GeoLite2-Country.mmdb
+          cp GeoLite2-Country.mmdb geoip.mmdb
+          
+          if [ -n "$(git status --porcelain GeoLite2-Country.mmdb)" ]; then
+            echo "发现 GeoIP 数据库存在更新，正在将其同步推送回当前代码分支..."
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add GeoLite2-Country.mmdb
+            git commit -m "Auto-update GeoLite2-Country.mmdb [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ 数据库代码库同步完成！"
+          else
+            echo "✅ 当前分支的数据库已是最新，无需执行 Git 提交。"
+          fi
         else
-          echo "⚠️ 下载最新 GeoIP 数据库失败，开始启用本地回退策略！"
+          echo "⚠️ 下载最新 GeoIP 数据库失败或超时，开始启用本地回退策略！"
+          rm -f temp_GeoLite2.mmdb
           if [ -f "GeoLite2-Country.mmdb" ]; then
             cp GeoLite2-Country.mmdb geoip.mmdb
-            echo "✅ 成功拷贝本地 GeoLite2-Country.mmdb 用于节点测速重命名。"
+            echo "✅ 成功提取当前分支中历史缓存的 GeoLite2-Country.mmdb 用于节点解析。"
           else
-            echo "❌ 错误：本地也未找到 GeoLite2-Country.mmdb，测速程序可能无法提供地理位置。"
+            echo "❌ 错误：本地也未找到 GeoLite2-Country.mmdb。"
           fi
         fi
 
