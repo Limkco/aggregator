@@ -39,7 +39,7 @@ OUTPUT_FILE = "nodes.txt"      # 清洗后的明文节点文件
 SUB_FILE = "sub.txt"           # Base64 订阅文件
 
 # [新增] 最大保留节点数量 (防止长期运行导致文件无限膨胀)
-MAX_NODES = 2000
+MAX_NODES = 10000
 
 # 并发数 (根据网络情况调整)
 CONCURRENCY = 200              
