@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import hashlib
+from urllib.parse import urlparse, parse_qs
 
 # --- 配置部分 ---
 INPUT_RAW = "nodes.txt"               # 本轮新聚合的节点
@@ -23,16 +24,44 @@ def safe_base64_decode(text):
         return None
 
 def get_node_hash(link):
-    """核心特征提取：无视节点备注/延迟后缀进行哈希对比"""
+    """核心特征提取：优先按 SNI/Host 进行哈希去重，无 SNI 时回退到核心参数"""
     link = link.strip()
     if "://" not in link:
         return hashlib.md5(link.encode('utf-8')).hexdigest()
     
+    # --- 新增：提取 SNI/Host 作为唯一标识 ---
     try:
         protocol, rest = link.split("://", 1)
         protocol = protocol.lower()
         
-        # vmess 需要解密 base64 后剔除 'ps' (备注) 字段
+        sni = None
+        if protocol == "vmess":
+            decoded = safe_base64_decode(rest)
+            if decoded:
+                conf = json.loads(decoded)
+                sni = conf.get("sni") or conf.get("host") or conf.get("add")
+        else:
+            parsed = urlparse(link)
+            qs = parse_qs(parsed.query)
+            sni = qs.get("sni", [None])[0] or qs.get("peer", [None])[0]
+            if not sni:
+                sni = parsed.hostname
+            # 兼容未带标准认证头（@）的特殊情况（如部分旧版 ss）
+            if not sni and '@' in rest:
+                body = rest.split('#')[0]
+                part_host = body.split('@')[-1]
+                sni = part_host.split(':')[0]
+                
+        if sni:
+            return hashlib.md5(f"sni_{sni}".encode('utf-8')).hexdigest()
+    except Exception:
+        pass
+
+    # --- 回退：无视节点备注/延迟后缀进行哈希对比 ---
+    try:
+        protocol, rest = link.split("://", 1)
+        protocol = protocol.lower()
+        
         if protocol == "vmess":
             decoded = safe_base64_decode(rest)
             if decoded:
@@ -41,7 +70,6 @@ def get_node_hash(link):
                 conf_str = json.dumps(conf, sort_keys=True)
                 return hashlib.md5(f"vmess://{conf_str}".encode('utf-8')).hexdigest()
         
-        # 其他协议直接去除 # 后面的备注信息
         core = rest.split("#")[0]
         return hashlib.md5(f"{protocol}://{core}".encode('utf-8')).hexdigest()
     except Exception:
