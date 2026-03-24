@@ -194,20 +194,30 @@ async def check_connectivity(link, semaphore):
             try: await writer.wait_closed()
             except: pass
             
-            # --- [新增] 附加功能 A：查询地理位置并格式化重命名节点 ---
+            # --- [修改] 查询地理位置并在原名称后面追加归属地速度 ---
             cc = get_country_code(host)
-            new_remark = f"[{cc}] {total_latency:.0f}ms"
             
             new_link = link
             if link.startswith("vmess://"):
                 try:
                     conf = json.loads(NodeParser.safe_base64_decode(link[8:]))
-                    conf["ps"] = new_remark
+                    # 获取原名称
+                    original_ps = conf.get("ps", "")
+                    # 在原名称后追加 -归属地速度
+                    conf["ps"] = f"{original_ps}-{cc}{total_latency:.0f}ms"
                     new_link = "vmess://" + base64.b64encode(json.dumps(conf, separators=(',', ':')).encode('utf-8')).decode('utf-8')
                 except Exception:
-                    new_link = link.split("#")[0] + "#" + quote(new_remark)
+                    # JSON 解析失败时的回退处理
+                    parts = link.split("#", 1)
+                    original_name = unquote(parts[1]) if len(parts) > 1 else ""
+                    new_remark = f"{original_name}-{cc}{total_latency:.0f}ms"
+                    new_link = parts[0] + "#" + quote(new_remark)
             else:
-                new_link = link.split("#")[0] + "#" + quote(new_remark)
+                # 处理通用 URI 协议 (Trojan, VLESS, SS等)
+                parts = link.split("#", 1)
+                original_name = unquote(parts[1]) if len(parts) > 1 else ""
+                new_remark = f"{original_name}-{cc}{total_latency:.0f}ms"
+                new_link = parts[0] + "#" + quote(new_remark)
 
             # 返回结果 (返回带地区和延迟的新链接)
             return (new_link, total_latency, f"{host}:{port}")
@@ -217,12 +227,10 @@ async def check_connectivity(link, semaphore):
             if writer:
                 try:
                     writer.close()
-                    # 避免等待太久
-                    # await writer.wait_closed() 
                 except: pass
             return None
         except Exception as e:
-            # --- [修改] 优化项 2: 消除吞没异常风险，改为安全的日志记录 ---
+            # 消除吞没异常风险，改为安全的日志记录
             logger.debug(f"节点检测发生内部异常 {host}:{port} - {type(e).__name__}: {str(e)}")
             if writer:
                 try: writer.close()
@@ -274,7 +282,7 @@ async def main():
     # 3. 排序 (延迟低优先)
     valid_nodes.sort(key=lambda x: x[1])
     
-    # --- [修改] 截取前 MAX_NODES 个最优节点，严格控制输出文件大小 ---
+    # 截取前 MAX_NODES 个最优节点，严格控制输出文件大小
     final_links = [x[0] for x in valid_nodes][:MAX_NODES]
     
     # 4. 保存
