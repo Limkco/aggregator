@@ -8,7 +8,7 @@ import logging
 import threading
 import queue
 import hashlib # [新增] 用于特征哈希计算
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs
 from typing import List, Set, Dict, Any, Optional, Union
 
 import requests
@@ -128,13 +128,44 @@ class NodeAggregator:
         except Exception:
             return None
 
-    # --- [新增] 核心特征值生成（优化项 1：去重逻辑） ---
+    # --- 核心特征值生成（优化项 1：去重逻辑） ---
     def _get_node_hash(self, link: str) -> str:
-        """剥离名称备注等冗余信息，仅对节点的核心连接参数进行哈希"""
+        """剥离名称备注等冗余信息，优先按 SNI/Host 进行哈希去重，无 SNI 时回退到核心参数"""
         link = link.strip()
         if "://" not in link:
             return hashlib.md5(link.encode('utf-8')).hexdigest()
         
+        # --- 新增：提取 SNI/Host 作为唯一标识 ---
+        try:
+            protocol, rest = link.split("://", 1)
+            protocol = protocol.lower()
+            
+            sni = None
+            if protocol == "vmess":
+                decoded = self.safe_base64_decode(rest)
+                if decoded:
+                    conf = json.loads(decoded)
+                    # vmess 的 sni 优先级：sni -> host -> add
+                    sni = conf.get("sni") or conf.get("host") or conf.get("add")
+            else:
+                parsed = urlparse(link)
+                qs = parse_qs(parsed.query)
+                # URI 协议的 sni 优先级：sni参数 -> peer参数 -> hostname
+                sni = qs.get("sni", [None])[0] or qs.get("peer", [None])[0]
+                if not sni:
+                    sni = parsed.hostname
+                # 兼容未带标准认证头（@）的特殊情况（如部分旧版 ss）
+                if not sni and '@' in rest:
+                    body = rest.split('#')[0]
+                    part_host = body.split('@')[-1]
+                    sni = part_host.split(':')[0]
+                    
+            if sni:
+                return hashlib.md5(f"sni_{sni}".encode('utf-8')).hexdigest()
+        except Exception:
+            pass
+
+        # --- 回退：如果提取不到 SNI，退回对核心连接参数进行哈希 ---
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
@@ -310,7 +341,7 @@ class NodeAggregator:
                         with self.nodes_lock:
                             count_before = len(self.nodes)
                             for node in nodes:
-                                # [核心改动：应用哈希去重逻辑]
+                                # [应用哈希去重逻辑]
                                 node_hash = self._get_node_hash(node)
                                 if node_hash not in self.seen_hashes:
                                     self.seen_hashes.add(node_hash)
