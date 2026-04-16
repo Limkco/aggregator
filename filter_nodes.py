@@ -80,15 +80,22 @@ def main():
     valid_nodes = []
     filtered_count = 0
 
+    # 【新增】将黑名单关键字统一转换为小写，预先处理以提高效率
+    lower_blacklist = [kw.lower() for kw in BLACKLIST_KEYWORDS]
+
     # 执行过滤逻辑
     for link in raw_lines:
         node_name = get_node_name(link)
         
+        # 【新增】将提取出的节点名称和解码后的链接统一转换为小写
+        lower_node_name = node_name.lower()
+        lower_link = unquote(link).lower()
+        
         is_banned = False
-        # 遍历黑名单关键字
-        for keyword in BLACKLIST_KEYWORDS:
-            # 同时检查节点名称和原始链接中是否包含关键字
-            if keyword in node_name or keyword in unquote(link):
+        # 遍历全小写的黑名单关键字
+        for keyword in lower_blacklist:
+            # 在全小写的名称和链接中进行包含匹配，实现不区分大小写
+            if keyword in lower_node_name or keyword in lower_link:
                 is_banned = True
                 break
                 
