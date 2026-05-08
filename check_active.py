@@ -7,13 +7,13 @@ import asyncio
 import ssl
 import time
 import logging
-import socket # [新增] 用于 DNS 解析
-from urllib.parse import urlparse, parse_qs, unquote, quote # [新增] 引入 quote 用于 URL 编码
+import socket # 用于 DNS 解析
+from urllib.parse import urlparse, parse_qs, unquote, quote 
 
-# --- [新增] 优化项 3: 严格版本兼容性断言 ---
+# --- 优化项: 严格版本兼容性断言 ---
 assert sys.version_info >= (3, 11), "SSL 检测要求 Python 3.11+"
 
-# --- [新增] 附加功能 A: GeoIP 数据库初始化 ---
+# --- 附加功能: GeoIP 数据库初始化 ---
 try:
     import maxminddb
     GEO_DB_PATH = "geoip.mmdb"
@@ -22,15 +22,18 @@ except ImportError:
     geo_reader = None
 
 async def get_country_code_async(host: str) -> str:
-    """[修复] 异步包装：根据主机域名或 IP 解析国家地区代码，避免阻塞事件循环"""
+    """[深度修复] 异步包装并支持 IPv4/IPv6 双栈解析，彻底释放并发性能"""
     if not geo_reader: return "UNK"
     try:
         loop = asyncio.get_running_loop()
-        # 将同步的 DNS 解析操作放入默认线程池执行，防止阻塞 asyncio
-        ip = await loop.run_in_executor(None, socket.gethostbyname, host)
-        res = geo_reader.get(ip)
-        if res and 'country' in res:
-            return res['country']['iso_code']
+        # [修复] 使用 getaddrinfo 替代 gethostbyname 以支持 IPv6
+        addr_info = await loop.run_in_executor(None, socket.getaddrinfo, host, None)
+        if addr_info:
+            # 提取解析到的第一个 IP 地址 (兼容 v4 和 v6)
+            ip = addr_info[0][4][0]
+            res = geo_reader.get(ip)
+            if res and 'country' in res:
+                return res['country']['iso_code']
     except Exception:
         pass
     return "UNK"
@@ -40,7 +43,7 @@ INPUT_FILE = "nodes.txt"       # 聚合生成的原始节点文件
 OUTPUT_FILE = "nodes.txt"      # 清洗后的明文节点文件
 SUB_FILE = "sub.txt"           # Base64 订阅文件
 
-# [新增] 最大保留节点数量 (防止长期运行导致文件无限膨胀)
+# 最大保留节点数量 (防止长期运行导致文件无限膨胀)
 MAX_NODES = 10000
 
 # 并发数 (根据网络情况调整)
@@ -196,8 +199,7 @@ async def check_connectivity(link, semaphore):
             try: await writer.wait_closed()
             except: pass
             
-            # --- [修改] 查询地理位置并在原名称后面追加归属地速度 ---
-            # 采用异步调用防止阻塞
+            # 查询地理位置并在原名称后面追加归属地速度 (采用异步调用防止阻塞)
             cc = await get_country_code_async(host)
             
             new_link = link
@@ -247,14 +249,13 @@ async def main():
         print(f"错误: 找不到 {INPUT_FILE}")
         return
 
-    # 1. 读取节点
-    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+    # 1. 读取节点 (使用 utf-8-sig 安全剥离隐蔽的 Windows BOM 头)
+    with open(INPUT_FILE, 'r', encoding='utf-8-sig') as f:
         raw_lines = [line.strip() for line in f if line.strip()]
     unique_nodes = list(set(raw_lines))
     print(f"初始节点数: {len(unique_nodes)}")
     
     # 2. 启动异步检测
-    # 注意：这里的 check_connectivity 内部已经包含了三个阶段的逻辑
     semaphore = asyncio.Semaphore(CONCURRENCY)
     tasks = [check_connectivity(node, semaphore) for node in unique_nodes]
     
@@ -288,7 +289,7 @@ async def main():
     # 截取前 MAX_NODES 个最优节点，严格控制输出文件大小
     final_links = [x[0] for x in valid_nodes][:MAX_NODES]
     
-    # 4. 保存
+    # 4. 保存 (输出文件继续使用标准的 utf-8 即可)
     try:
         with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
             f.write("\n".join(final_links))
