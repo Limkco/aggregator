@@ -87,15 +87,22 @@ def main():
     for link in raw_lines:
         node_name = get_node_name(link)
         
-        # 【新增】将提取出的节点名称和解码后的链接统一转换为小写
+        # 将提取出的节点名称和解码后的链接统一转换为小写
         lower_node_name = node_name.lower()
         lower_link = unquote(link).lower()
+        
+        # --- [修复] 针对 vmess 提取深层 JSON 供过滤，防止脏数据通过 base64 绕过 ---
+        vmess_payload = ""
+        if link.startswith("vmess://"):
+            decoded_json = safe_base64_decode(link[8:])
+            if decoded_json:
+                vmess_payload = decoded_json.lower()
         
         is_banned = False
         # 遍历全小写的黑名单关键字
         for keyword in lower_blacklist:
-            # 在全小写的名称和链接中进行包含匹配，实现不区分大小写
-            if keyword in lower_node_name or keyword in lower_link:
+            # 在全小写的名称、链接、以及解密后的 VMess 负载中进行包含匹配
+            if keyword in lower_node_name or keyword in lower_link or keyword in vmess_payload:
                 is_banned = True
                 break
                 
