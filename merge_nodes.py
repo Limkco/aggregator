@@ -29,7 +29,7 @@ def get_node_hash(link):
     if "://" not in link:
         return hashlib.md5(link.encode('utf-8')).hexdigest()
     
-    # --- 新增：提取 SNI/Host 作为唯一标识 ---
+    # --- 提取 SNI/Host 作为唯一标识 ---
     try:
         protocol, rest = link.split("://", 1)
         protocol = protocol.lower()
@@ -89,11 +89,12 @@ def main():
         if not os.path.exists(filepath):
             continue
             
-        with open(filepath, 'r', encoding='utf-8') as f:
+        # [深度修复] 使用 utf-8-sig 安全读取，剥离可能的 Windows BOM 头 (\ufeff)
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
             lines = [line.strip() for line in f if line.strip()]
         
         for link in lines:
-            # --- [修复] 增加基础的有效性与长度校验，防止无效脏数据引发的无意义哈希和空间浪费 ---
+            # 增加基础的有效性与长度校验，防止无效脏数据引发的无意义哈希和空间浪费
             if len(link) < 15 or "://" not in link:
                 continue
                 
@@ -104,7 +105,7 @@ def main():
 
     print(f"合并并去重后，即将送入测速环节的总节点数: {len(unique_nodes)}")
     
-    # 覆盖原 nodes.txt 供下游（关键字过滤和测速）读取
+    # 覆盖原 nodes.txt 供下游（关键字过滤和测速）读取，输出依然采用标准 utf-8
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         f.write("\n".join(unique_nodes))
 
