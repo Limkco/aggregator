@@ -21,11 +21,13 @@ try:
 except ImportError:
     geo_reader = None
 
-def get_country_code(host: str) -> str:
-    """[新增] 根据主机域名或 IP 解析国家地区代码"""
+async def get_country_code_async(host: str) -> str:
+    """[修复] 异步包装：根据主机域名或 IP 解析国家地区代码，避免阻塞事件循环"""
     if not geo_reader: return "UNK"
     try:
-        ip = socket.gethostbyname(host)
+        loop = asyncio.get_running_loop()
+        # 将同步的 DNS 解析操作放入默认线程池执行，防止阻塞 asyncio
+        ip = await loop.run_in_executor(None, socket.gethostbyname, host)
         res = geo_reader.get(ip)
         if res and 'country' in res:
             return res['country']['iso_code']
@@ -195,7 +197,8 @@ async def check_connectivity(link, semaphore):
             except: pass
             
             # --- [修改] 查询地理位置并在原名称后面追加归属地速度 ---
-            cc = get_country_code(host)
+            # 采用异步调用防止阻塞
+            cc = await get_country_code_async(host)
             
             new_link = link
             if link.startswith("vmess://"):
