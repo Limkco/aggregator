@@ -71,8 +71,8 @@ def main():
         print(f"错误: 找不到输入文件 {INPUT_FILE}")
         return
 
-    # 读取原始节点
-    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+    # [修复] 使用 utf-8-sig 安全读取，剥离可能的 Windows BOM 头 (\ufeff)
+    with open(INPUT_FILE, 'r', encoding='utf-8-sig') as f:
         raw_lines = [line.strip() for line in f if line.strip()]
         
     print(f"初始读取节点数: {len(raw_lines)}")
@@ -80,7 +80,7 @@ def main():
     valid_nodes = []
     filtered_count = 0
 
-    # 【新增】将黑名单关键字统一转换为小写，预先处理以提高效率
+    # 将黑名单关键字统一转换为小写，预先处理以提高效率
     lower_blacklist = [kw.lower() for kw in BLACKLIST_KEYWORDS]
 
     # 执行过滤逻辑
@@ -91,18 +91,38 @@ def main():
         lower_node_name = node_name.lower()
         lower_link = unquote(link).lower()
         
-        # --- [修复] 针对 vmess 提取深层 JSON 供过滤，防止脏数据通过 base64 绕过 ---
-        vmess_payload = ""
+        # --- [深度修复] 提取深层负载供过滤，防止脏数据通过 base64 绕过 ---
+        payload_content = ""
+        
+        # 1. 拦截 VMess 中隐藏在 JSON 字段里的脏词
         if link.startswith("vmess://"):
             decoded_json = safe_base64_decode(link[8:])
             if decoded_json:
-                vmess_payload = decoded_json.lower()
+                payload_content = decoded_json.lower()
+                
+        # 2. 拦截 Shadowsocks SIP002 规范中整体 Base64 编码的脏词
+        elif link.startswith("ss://"):
+            try:
+                body = link[5:].split('#')[0]
+                if '@' not in body:
+                    # SIP002 整体 base64 编码
+                    decoded_ss = safe_base64_decode(body)
+                    if decoded_ss:
+                        payload_content = decoded_ss.lower()
+                else:
+                    # 仅 user_info 进行了 base64 编码
+                    user_info = body.split('@')[0]
+                    decoded_user = safe_base64_decode(user_info)
+                    if decoded_user:
+                        payload_content = decoded_user.lower()
+            except Exception:
+                pass
         
         is_banned = False
         # 遍历全小写的黑名单关键字
         for keyword in lower_blacklist:
-            # 在全小写的名称、链接、以及解密后的 VMess 负载中进行包含匹配
-            if keyword in lower_node_name or keyword in lower_link or keyword in vmess_payload:
+            # 在全小写的名称、链接、以及解密后的 VMess/SS 负载中进行无死角包含匹配
+            if keyword in lower_node_name or keyword in lower_link or keyword in payload_content:
                 is_banned = True
                 break
                 
@@ -113,7 +133,7 @@ def main():
             # 开启调试时可打印被过滤的节点名称
             # print(f"已过滤: {node_name or '未知名称'}")
 
-    # 保存明文节点结果
+    # 保存明文节点结果 (输出使用标准的 utf-8 即可)
     try:
         with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
             f.write("\n".join(valid_nodes))
