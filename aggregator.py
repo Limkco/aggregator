@@ -7,7 +7,7 @@ import random
 import logging
 import threading
 import queue
-import hashlib # [新增] 用于特征哈希计算
+import hashlib # 用于特征哈希计算
 from urllib.parse import quote, urlparse, parse_qs
 from typing import List, Set, Dict, Any, Optional, Union
 
@@ -56,7 +56,7 @@ class NodeAggregator:
     def __init__(self, token: Optional[str]):
         self.github_token = token
         self.nodes: Set[str] = set()
-        self.seen_hashes: Set[str] = set() # [新增] 用于特征值去重的哈希集合
+        self.seen_hashes: Set[str] = set() # 用于特征值去重的哈希集合
         self.nodes_lock = threading.Lock() # 线程锁，保护集合写入安全
         
         # 初始化 Session (包含连接池优化)
@@ -135,7 +135,7 @@ class NodeAggregator:
         if "://" not in link:
             return hashlib.md5(link.encode('utf-8')).hexdigest()
         
-        # --- 新增：提取 SNI/Host 作为唯一标识 ---
+        # 提取 SNI/Host 作为唯一标识
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
@@ -165,7 +165,7 @@ class NodeAggregator:
         except Exception:
             pass
 
-        # --- 回退：如果提取不到 SNI，退回对核心连接参数进行哈希 ---
+        # 回退：如果提取不到 SNI，退回对核心连接参数进行哈希
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
@@ -184,8 +184,6 @@ class NodeAggregator:
             return hashlib.md5(f"{protocol}://{core}".encode('utf-8')).hexdigest()
         except Exception:
             return hashlib.md5(link.encode('utf-8')).hexdigest()
-
-    # --- [完整保留] 节点构建逻辑 ---
 
     def _build_vmess_link(self, config: Dict[str, Any]) -> Optional[str]:
         """将字典配置转换为 vmess:// 标准链接"""
@@ -275,8 +273,6 @@ class NodeAggregator:
                 extracted.append(link)
         return extracted
 
-    # --- [完整保留] 核心提取逻辑 ---
-
     def extract_nodes(self, text: str) -> List[str]:
         if not text:
             return []
@@ -320,8 +316,6 @@ class NodeAggregator:
             
         return found_nodes
 
-    # --- 生产者-消费者并发架构 (核心优化) ---
-
     def fetch_worker(self):
         """消费者线程：从队列获取URL并下载解析"""
         while not self.should_stop:
@@ -332,7 +326,6 @@ class NodeAggregator:
                 continue
             
             try:
-                # 使用全局 TIMEOUT 常量
                 resp = self.session.get(url, timeout=TIMEOUT)
                 if resp.status_code == 200:
                     # 调用完整的提取逻辑
@@ -341,11 +334,11 @@ class NodeAggregator:
                         with self.nodes_lock:
                             count_before = len(self.nodes)
                             for node in nodes:
-                                # --- [修复] 阻挡无效长度和无协议头的畸形数据 ---
+                                # [深度修复] 阻挡无效长度和无协议头的畸形数据，防脏数据消耗
                                 if len(node) < 15 or "://" not in node:
                                     continue
                                     
-                                # [应用哈希去重逻辑]
+                                # 应用哈希去重逻辑
                                 node_hash = self._get_node_hash(node)
                                 if node_hash not in self.seen_hashes:
                                     self.seen_hashes.add(node_hash)
@@ -363,7 +356,7 @@ class NodeAggregator:
         logger.info(f"开始搜索 GitHub, 关键词队列: {len(KEYWORDS)} 个")
         random.shuffle(KEYWORDS) # 打乱顺序
         
-        consecutive_limit_hits = 0 # 新增：连续风控计数器
+        consecutive_limit_hits = 0 # 连续风控计数器
 
         for keyword in KEYWORDS:
             if self.should_stop: break
@@ -384,7 +377,7 @@ class NodeAggregator:
                     query = f"{keyword} extension:{ext}"
                     api_url = f"https://api.github.com/search/code?q={query}&per_page=20&page={page}&sort=indexed&order=desc"
                     
-                    # === 智能重试循环 (防止丢失数据) ===
+                    # 智能重试循环 (防止丢失数据)
                     max_retries = 3
                     success = False
                     
@@ -394,9 +387,9 @@ class NodeAggregator:
                             
                             # 触发速率限制：原地等待并重试，绝不跳过
                             if resp.status_code in [403, 429]:
-                                consecutive_limit_hits += 1 # 计数 +1
+                                consecutive_limit_hits += 1
                                 
-                                # 新增：连续4次风控则熔断
+                                # 连续4次风控则熔断
                                 if consecutive_limit_hits >= 4:
                                     logger.warning("连续 4 次触发 API 速率限制，判定为高风险，停止搜索任务并进入后续处理...")
                                     return 
@@ -420,7 +413,6 @@ class NodeAggregator:
                                             raw_url = html_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
                                             self.url_queue.put(raw_url)
                                 else:
-                                    # 当前页无结果，通常后续页也无结果，跳出页码循环
                                     pass 
                                 
                                 success = True
@@ -428,7 +420,7 @@ class NodeAggregator:
                             
                             else:
                                 logger.error(f"API 错误 {resp.status_code}")
-                                break # 其他错误（如404）不重试
+                                break # 其他错误不重试
                                 
                         except Exception as e:
                             logger.error(f"搜索请求异常: {e}")
@@ -437,11 +429,9 @@ class NodeAggregator:
                     # 动态随机休眠
                     time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 1.0))
                     
-                    # 如果这一页本来就没结果，不需要继续翻后面的页码
                     if success and not found_items_in_this_combo:
                          break
                 
-                # 处理下一个后缀
                 pass 
 
         logger.info("所有搜索任务已遍历完成")
@@ -473,6 +463,12 @@ class NodeAggregator:
         
         # 4. 保存结果
         self._save_results()
+        
+        # [深度修复] 优雅释放网络连接池资源
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     def _save_results(self):
         logger.info(f"=== 最终统计: 共获取 {len(self.nodes)} 个唯一节点 ===")
