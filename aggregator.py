@@ -341,6 +341,10 @@ class NodeAggregator:
                         with self.nodes_lock:
                             count_before = len(self.nodes)
                             for node in nodes:
+                                # --- [修复] 阻挡无效长度和无协议头的畸形数据 ---
+                                if len(node) < 15 or "://" not in node:
+                                    continue
+                                    
                                 # [应用哈希去重逻辑]
                                 node_hash = self._get_node_hash(node)
                                 if node_hash not in self.seen_hashes:
