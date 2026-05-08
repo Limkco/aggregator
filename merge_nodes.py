@@ -93,6 +93,10 @@ def main():
             lines = [line.strip() for line in f if line.strip()]
         
         for link in lines:
+            # --- [修复] 增加基础的有效性与长度校验，防止无效脏数据引发的无意义哈希和空间浪费 ---
+            if len(link) < 15 or "://" not in link:
+                continue
+                
             nhash = get_node_hash(link)
             if nhash not in seen_hashes:
                 seen_hashes.add(nhash)
