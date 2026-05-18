@@ -34,16 +34,16 @@ KEYWORDS: List[str] = [
 EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
 
 MAX_PAGES: int = 2            # 每个关键词搜索的页数
-SEARCH_INTERVAL: float = 5.0  # 搜索请求的基础间隔(秒)，配合重试机制使用
-MAX_EXECUTION_TIME: int = 600 # 全局最大运行时间 (1小时)
+SEARCH_INTERVAL: float = 3.0  # 搜索请求的基础间隔(秒)，配合重试机制使用
+MAX_EXECUTION_TIME: int = 300 # 全局最大运行时间 (1小时)
 TIMEOUT: int = 10             # 单个文件下载超时时间 (秒)
 DOWNLOAD_WORKERS: int = 10    # 下载线程数 (设置为10以降低并发风控风险)
 
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
-# 增强型正则：支持标准协议头，以及 #备注 和 [] 包裹的 IPv6
-LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[a-zA-Z0-9+/=_@.:?&%#\[\]-]+')
+# [首轮修复] 增强型正则：补充了逗号(,)、波浪号(~)、竖线(|)等合法URI字符，防止 VLESS Reality 参数截断丢失
+LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[a-zA-Z0-9+/=_@.:?&%#\[\]\-,;~|()!*]+')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,7 +88,6 @@ class NodeAggregator:
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["GET"]
         )
-        # [关键优化] pool_connections = DOWNLOAD_WORKERS
         # 确保每个线程都有独立的连接可用，无需频繁建立/关闭 TCP 连接
         adapter = HTTPAdapter(
             max_retries=retry,
@@ -142,7 +141,9 @@ class NodeAggregator:
             
             sni = None
             if protocol == "vmess":
-                decoded = self.safe_base64_decode(rest)
+                # [深度同步修复 1] 剥离畸形备注，防止解码崩溃导致去重降级
+                b64_core = rest.split('#')[0]
+                decoded = self.safe_base64_decode(b64_core)
                 if decoded:
                     conf = json.loads(decoded)
                     # vmess 的 sni 优先级：sni -> host -> add
@@ -158,7 +159,13 @@ class NodeAggregator:
                 if not sni and '@' in rest:
                     body = rest.split('#')[0]
                     part_host = body.split('@')[-1]
-                    sni = part_host.split(':')[0]
+                    
+                    # [深度同步修复 2] 剥离混淆插件参数并安全处理 IPv6，防止提取错乱
+                    part_host = part_host.split('/?')[0].split('?')[0]
+                    if part_host.startswith('['):
+                        sni = part_host.rsplit(':', 1)[0].strip('[]')
+                    else:
+                        sni = part_host.rsplit(':', 1)[0]
                     
             if sni:
                 return hashlib.md5(f"sni_{sni}".encode('utf-8')).hexdigest()
@@ -172,7 +179,9 @@ class NodeAggregator:
             
             # vmess 需要解密 base64 后剔除 'ps' (备注) 字段
             if protocol == "vmess":
-                decoded = self.safe_base64_decode(rest)
+                # [深度同步修复 1] 同步在回退逻辑中剥离尾巴
+                b64_core = rest.split('#')[0]
+                decoded = self.safe_base64_decode(b64_core)
                 if decoded:
                     conf = json.loads(decoded)
                     conf.pop("ps", None) 
@@ -277,7 +286,7 @@ class NodeAggregator:
         if not text:
             return []
             
-        # [深度修复 1] 还原 HTML 实体转义字符，彻底解决被正则分号阻断从而引发的 &amp# 畸形拼接 BUG
+        # [首轮修复] 还原 HTML 实体转义字符，彻底解决 &amp# 畸形拼接 BUG
         text = text.replace('&amp;', '&')
         
         found_nodes = []
@@ -338,7 +347,7 @@ class NodeAggregator:
                         with self.nodes_lock:
                             count_before = len(self.nodes)
                             for node in nodes:
-                                # [深度修复] 阻挡无效长度和无协议头的畸形数据，防脏数据消耗
+                                # [首轮修复] 阻挡无效长度和无协议头的畸形数据，防脏数据消耗
                                 if len(node) < 15 or "://" not in node:
                                     continue
                                     
@@ -468,7 +477,7 @@ class NodeAggregator:
         # 4. 保存结果
         self._save_results()
         
-        # [深度修复] 优雅释放网络连接池资源
+        # 优雅释放网络连接池资源
         try:
             self.session.close()
         except Exception:
