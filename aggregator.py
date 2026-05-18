@@ -276,6 +276,10 @@ class NodeAggregator:
     def extract_nodes(self, text: str) -> List[str]:
         if not text:
             return []
+            
+        # [深度修复 1] 还原 HTML 实体转义字符，彻底解决被正则分号阻断从而引发的 &amp# 畸形拼接 BUG
+        text = text.replace('&amp;', '&')
+        
         found_nodes = []
         
         # 策略 1: 正则直接提取
