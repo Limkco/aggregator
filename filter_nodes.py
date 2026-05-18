@@ -46,7 +46,8 @@ def get_node_name(link):
     # 1. 处理 VMess 协议
     if link.startswith("vmess://"):
         try:
-            b64_str = link[8:]
+            # [深度修复 1] 强制剥离尾随的 #备注，防止 Base64 解码雪崩
+            b64_str = link[8:].split('#')[0]
             json_str = safe_base64_decode(b64_str)
             conf = json.loads(json_str)
             return conf.get("ps", "")
@@ -71,7 +72,7 @@ def main():
         print(f"错误: 找不到输入文件 {INPUT_FILE}")
         return
 
-    # [修复] 使用 utf-8-sig 安全读取，剥离可能的 Windows BOM 头 (\ufeff)
+    # 使用 utf-8-sig 安全读取，剥离可能的 Windows BOM 头 (\ufeff)
     with open(INPUT_FILE, 'r', encoding='utf-8-sig') as f:
         raw_lines = [line.strip() for line in f if line.strip()]
         
@@ -91,12 +92,14 @@ def main():
         lower_node_name = node_name.lower()
         lower_link = unquote(link).lower()
         
-        # --- [深度修复] 提取深层负载供过滤，防止脏数据通过 base64 绕过 ---
+        # --- 提取深层负载供过滤，防止脏数据通过 base64 绕过 ---
         payload_content = ""
         
         # 1. 拦截 VMess 中隐藏在 JSON 字段里的脏词
         if link.startswith("vmess://"):
-            decoded_json = safe_base64_decode(link[8:])
+            # [深度修复 1] 强制剥离尾随的畸形备注，保证提取深层 payload 时不会崩溃
+            b64_core = link[8:].split('#')[0]
+            decoded_json = safe_base64_decode(b64_core)
             if decoded_json:
                 payload_content = decoded_json.lower()
                 
