@@ -33,17 +33,18 @@ KEYWORDS: List[str] = [
 # 文件后缀：包含 yml 以覆盖更多 Clash 配置
 EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
 
-MAX_PAGES: int = 2            # 每个关键词搜索的页数
+MAX_PAGES: int = 3            # 每个关键词搜索的页数
 SEARCH_INTERVAL: float = 3.0  # 搜索请求的基础间隔(秒)，配合重试机制使用
-MAX_EXECUTION_TIME: int = 300 # 全局最大运行时间 (1小时)
+MAX_EXECUTION_TIME: int = 3600 # 全局最大运行时间 (1小时)
 TIMEOUT: int = 10             # 单个文件下载超时时间 (秒)
 DOWNLOAD_WORKERS: int = 10    # 下载线程数 (设置为10以降低并发风控风险)
 
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
-# [首轮修复] 增强型正则：补充了逗号(,)、波浪号(~)、竖线(|)等合法URI字符，防止 VLESS Reality 参数截断丢失
-LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[a-zA-Z0-9+/=_@.:?&%#\[\]\-,;~|()!*]+')
+# [终极修复] 增强型宽泛正则：直接匹配到空白符或尖括号结束
+# 彻底解决包含 {}, "", '' 等特殊字符的 xhttp extra JSON 参数被截断的问题
+LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>]+')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,14 +135,14 @@ class NodeAggregator:
         if "://" not in link:
             return hashlib.md5(link.encode('utf-8')).hexdigest()
         
-        # 提取 SNI/Host 作为唯一标识
+        # --- 提取 SNI/Host 作为唯一标识 ---
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
             
             sni = None
             if protocol == "vmess":
-                # [深度同步修复 1] 剥离畸形备注，防止解码崩溃导致去重降级
+                # 剥离畸形备注，防止解码崩溃导致去重降级
                 b64_core = rest.split('#')[0]
                 decoded = self.safe_base64_decode(b64_core)
                 if decoded:
@@ -160,7 +161,7 @@ class NodeAggregator:
                     body = rest.split('#')[0]
                     part_host = body.split('@')[-1]
                     
-                    # [深度同步修复 2] 剥离混淆插件参数并安全处理 IPv6，防止提取错乱
+                    # 剥离混淆插件参数并安全处理 IPv6，防止提取错乱
                     part_host = part_host.split('/?')[0].split('?')[0]
                     if part_host.startswith('['):
                         sni = part_host.rsplit(':', 1)[0].strip('[]')
@@ -172,14 +173,13 @@ class NodeAggregator:
         except Exception:
             pass
 
-        # 回退：如果提取不到 SNI，退回对核心连接参数进行哈希
+        # --- 回退：如果提取不到 SNI，退回对核心连接参数进行哈希 ---
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
             
             # vmess 需要解密 base64 后剔除 'ps' (备注) 字段
             if protocol == "vmess":
-                # [深度同步修复 1] 同步在回退逻辑中剥离尾巴
                 b64_core = rest.split('#')[0]
                 decoded = self.safe_base64_decode(b64_core)
                 if decoded:
@@ -286,27 +286,37 @@ class NodeAggregator:
         if not text:
             return []
             
-        # [首轮修复] 还原 HTML 实体转义字符，彻底解决 &amp# 畸形拼接 BUG
-        text = text.replace('&amp;', '&')
-        
+        def clean_node(match: str) -> str:
+            """智能括号平衡清洗算法：防止正则剥离 xhttp extra 内部有效的 } 导致 JSON 崩塌"""
+            while match and match[-1] in ('}', ']', ')', '>', '"', "'", ',', ';'):
+                if match[-1] == '}':
+                    if match.count('{') < match.count('}'): 
+                        match = match[:-1]
+                    else: 
+                        break
+                elif match[-1] == ']':
+                    if match.count('[') < match.count(']'): 
+                        match = match[:-1]
+                    else: 
+                        break
+                elif match[-1] == ')':
+                    if match.count('(') < match.count(')'): 
+                        match = match[:-1]
+                    else: 
+                        break
+                else:
+                    match = match[:-1]
+            return match
+
         found_nodes = []
         
-        # 策略 1: 正则直接提取
-        regex_matches = LINK_PATTERN.findall(text)
-        found_nodes.extend(regex_matches)
-        
-        # 策略 2: Base64 解码后正则提取
-        decoded = self.safe_base64_decode(text)
-        if decoded:
-            decoded_matches = LINK_PATTERN.findall(decoded)
-            found_nodes.extend(decoded_matches)
-
-        # 策略 3: JSON/YAML 解析 (针对结构化订阅)
+        # --- 策略 1: 结构化优先提取 (获取最纯净、无编码污染的配置) ---
         text_stripped = text.strip()
         is_json_like = text_stripped.startswith('{') or text_stripped.startswith('[')
         is_yaml_like = "proxies:" in text_stripped or "name:" in text_stripped
 
         parsed_data = None
+        
         # 3.1 尝试 JSON
         if is_json_like:
             try:
@@ -326,8 +336,25 @@ class NodeAggregator:
             structured_nodes = self._extract_from_structured_data(parsed_data)
             if structured_nodes:
                 found_nodes.extend(structured_nodes)
+                
+        # --- [核心修复] 深度清洗各类转义字符，防 pbk 和 extra 断裂 ---
+        text_clean = text.replace('&amp;', '&').replace('\\u0026', '&').replace('\\/', '/').replace('\\"', '"').replace('\\\\', '\\')
+        
+        # --- 策略 2: 宽泛正则直接提取 ---
+        raw_matches = LINK_PATTERN.findall(text_clean)
+        for match in raw_matches:
+            found_nodes.append(clean_node(match))
             
-        return found_nodes
+        # --- 策略 3: Base64 解码后正则提取 ---
+        decoded = self.safe_base64_decode(text)
+        if decoded:
+            decoded_clean = decoded.replace('&amp;', '&').replace('\\u0026', '&').replace('\\/', '/').replace('\\"', '"').replace('\\\\', '\\')
+            decoded_matches = LINK_PATTERN.findall(decoded_clean)
+            for match in decoded_matches:
+                found_nodes.append(clean_node(match))
+                
+        # 初筛：过滤太短的无效字符串
+        return [node for node in found_nodes if len(node) > 15]
 
     def fetch_worker(self):
         """消费者线程：从队列获取URL并下载解析"""
@@ -347,7 +374,7 @@ class NodeAggregator:
                         with self.nodes_lock:
                             count_before = len(self.nodes)
                             for node in nodes:
-                                # [首轮修复] 阻挡无效长度和无协议头的畸形数据，防脏数据消耗
+                                # 阻挡无效长度和无协议头的畸形数据
                                 if len(node) < 15 or "://" not in node:
                                     continue
                                     
