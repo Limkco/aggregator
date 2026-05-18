@@ -36,7 +36,9 @@ def get_node_hash(link):
         
         sni = None
         if protocol == "vmess":
-            decoded = safe_base64_decode(rest)
+            # [深度修复 1] 强制剥离尾随的畸形备注，防止 Base64 解码雪崩导致去重失效
+            b64_core = rest.split('#')[0]
+            decoded = safe_base64_decode(b64_core)
             if decoded:
                 conf = json.loads(decoded)
                 sni = conf.get("sni") or conf.get("host") or conf.get("add")
@@ -50,7 +52,13 @@ def get_node_hash(link):
             if not sni and '@' in rest:
                 body = rest.split('#')[0]
                 part_host = body.split('@')[-1]
-                sni = part_host.split(':')[0]
+                
+                # [深度修复 2] 剥离混淆插件参数并安全处理 IPv6 的特征提取
+                part_host = part_host.split('/?')[0].split('?')[0]
+                if part_host.startswith('['):
+                    sni = part_host.rsplit(':', 1)[0].strip('[]')
+                else:
+                    sni = part_host.rsplit(':', 1)[0]
                 
         if sni:
             return hashlib.md5(f"sni_{sni}".encode('utf-8')).hexdigest()
@@ -63,7 +71,9 @@ def get_node_hash(link):
         protocol = protocol.lower()
         
         if protocol == "vmess":
-            decoded = safe_base64_decode(rest)
+            # [深度修复 1] 同步在回退逻辑中剥离尾巴
+            b64_core = rest.split('#')[0]
+            decoded = safe_base64_decode(b64_core)
             if decoded:
                 conf = json.loads(decoded)
                 conf.pop("ps", None) 
@@ -89,7 +99,7 @@ def main():
         if not os.path.exists(filepath):
             continue
             
-        # [深度修复] 使用 utf-8-sig 安全读取，剥离可能的 Windows BOM 头 (\ufeff)
+        # 使用 utf-8-sig 安全读取，剥离可能的 Windows BOM 头 (\ufeff)
         with open(filepath, 'r', encoding='utf-8-sig') as f:
             lines = [line.strip() for line in f if line.strip()]
         
