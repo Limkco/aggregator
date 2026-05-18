@@ -8,6 +8,7 @@ import ssl
 import time
 import logging
 import socket # 用于 DNS 解析
+import ipaddress # [深度修复 4] 用于校验 SNI 是否为纯 IP
 from urllib.parse import urlparse, parse_qs, unquote, quote 
 
 # --- 优化项: 严格版本兼容性断言 ---
@@ -52,7 +53,7 @@ CONCURRENCY = 200
 TCP_TIMEOUT = 2    # TCP 连接超时 (快速筛选)
 SSL_TIMEOUT = 3    # SSL 握手超时 (验证可用性)
 
-# [深度修复 2] 预编译标准 UUID 正则，用于拦截非法格式的 VLESS/VMess 节点
+# [防毒化修复] 预编译标准 UUID 正则，用于拦截非法格式的 VLESS/VMess 节点
 UUID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 
 # --- 日志配置 ---
@@ -82,22 +83,23 @@ class NodeParser:
     def parse(link):
         """
         解析各类节点链接
-        返回: (host, port, sni, is_tls)
+        返回: (host, port, sni, is_tls, is_udp)
         """
         link = link.strip()
-        host, port, sni, is_tls = None, None, None, False
+        host, port, sni, is_tls, is_udp = None, None, None, False, False
         
         try:
             # --- 1. VMess ---
             if link.startswith("vmess://"):
                 try:
-                    b64_str = link[8:]
+                    # [深度修复 1] 强制剥离尾随的 #备注，防止 Base64 解码雪崩
+                    b64_str = link[8:].split('#')[0]
                     json_str = NodeParser.safe_base64_decode(b64_str)
                     conf = json.loads(json_str)
                     
-                    # [深度拦截] 拦截格式非法的伪造 UUID
+                    # 拦截格式非法的伪造 UUID
                     if not UUID_PATTERN.match(str(conf.get("id", ""))):
-                        return None, None, None, False
+                        return None, None, None, False, False
                         
                     host = conf.get("add")
                     port = conf.get("port")
@@ -118,10 +120,19 @@ class NodeParser:
                         part_host = decoded.split('@')[1] if '@' in decoded else ""
                     
                     if part_host:
-                        h, p = part_host.split(':')
-                        host = h
-                        port = int(p)
-                    # 普通 SS 默认无 TLS，除非你有特定识别 plugin 的逻辑，否则这里 is_tls 为 False
+                        # [深度修复 2] 剥离尾随的 /?plugin= 混淆插件参数
+                        part_host = part_host.split('/?')[0].split('?')[0]
+                        
+                        # [深度修复 2] 安全处理 IPv6 和 IPv4 的端口切分
+                        if part_host.startswith('['):
+                            # 处理 IPv6 格式，例如 [2001:db8::1]:8388
+                            h, p = part_host.rsplit(':', 1)
+                            host = h.strip('[]')
+                            port = int(p)
+                        else:
+                            h, p = part_host.rsplit(':', 1)
+                            host = h
+                            port = int(p)
                 except: pass
 
             # --- 3. URL Schema (Trojan, VLESS, Hysteria2) ---
@@ -130,10 +141,9 @@ class NodeParser:
                     parsed = urlparse(link)
                     scheme = parsed.scheme.lower()
                     
-                    # [深度拦截] VLESS 的 username 必须是合法 UUID
                     if scheme == "vless":
                         if not UUID_PATTERN.match(str(parsed.username or "")):
-                            return None, None, None, False
+                            return None, None, None, False, False
                             
                     host = parsed.hostname
                     port = parsed.port
@@ -144,8 +154,13 @@ class NodeParser:
                     if scheme == "trojan":
                         if security != "none": is_tls = True
                     
-                    # VLESS / Hysteria2
-                    elif scheme in ["vless", "hysteria2", "hy2"]:
+                    # Hysteria2 / hy2 (基于 QUIC 纯 UDP 协议)
+                    elif scheme in ["hysteria2", "hy2"]:
+                        is_tls = True
+                        is_udp = True # [深度修复 3] 标记为 UDP 协议，跳过 TCP 测速
+                        
+                    # VLESS
+                    elif scheme == "vless":
                         if security in ["tls", "reality", "auto"]: is_tls = True
                     
                     if is_tls:
@@ -156,9 +171,9 @@ class NodeParser:
             if port: port = int(port)
                 
         except Exception:
-            return None, None, None, False
+            return None, None, None, False, False
 
-        return host, port, sni, is_tls
+        return host, port, sni, is_tls, is_udp
 
 async def check_connectivity(link, semaphore):
     """
@@ -167,11 +182,10 @@ async def check_connectivity(link, semaphore):
     2. TCP Ping (连接端口)
     3. SSL Handshake (验证协议)
     """
-    # [阶段1] 解析并静态过滤
-    host, port, sni, is_tls = NodeParser.parse(link)
+    host, port, sni, is_tls, is_udp = NodeParser.parse(link)
     
-    # 如果不是 TLS 节点，直接抛弃 (符合"先执行过滤非 TLS 节点")
-    if not is_tls:
+    # 过滤掉非 TLS，但保留被标记为 is_udp 的协议 (Hysteria2)
+    if not is_tls and not is_udp:
         return None
     if not host or not port:
         return None
@@ -179,84 +193,87 @@ async def check_connectivity(link, semaphore):
     async with semaphore:
         writer = None
         try:
-            # [阶段2] TCP Ping (去掉不在线节点)
             start_time = time.time()
-            # 建立纯 TCP 连接
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), 
-                timeout=TCP_TIMEOUT
-            )
-            tcp_latency = (time.time() - start_time) * 1000
             
-            # 如果能走到这里，说明 TCP 是通的 (在线)
+            if is_udp:
+                # [深度修复 3] Hysteria2 协议直接放行，虚拟一个极低的延迟使其排在前面
+                total_latency = 0 
+            else:
+                # 建立纯 TCP 连接
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), 
+                    timeout=TCP_TIMEOUT
+                )
+                tcp_latency = (time.time() - start_time) * 1000
+                
+                # [深度修复 4] 校验 SNI 是否为纯 IP，如果是则置为 None，防止 OpenSSL 崩溃
+                tls_sni = sni
+                if sni:
+                    try:
+                        ipaddress.ip_address(sni)
+                        tls_sni = None 
+                    except ValueError:
+                        pass
+                
+                # 准备 SSL 上下文
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                
+                start_ssl = time.time()
+                await asyncio.wait_for(
+                    writer.start_tls(ssl_ctx, server_hostname=tls_sni),
+                    timeout=SSL_TIMEOUT
+                )
+                ssl_handshake_latency = (time.time() - start_ssl) * 1000
+                total_latency = tcp_latency + ssl_handshake_latency
+                
+                # 安全关闭
+                writer.close()
+                try: await writer.wait_closed()
+                except: pass
             
-            # [阶段3] SSL 握手 (去掉无效/伪TLS节点)
-            # 准备 SSL 上下文
-            ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-            
-            # 在现有 TCP 连接上升级 SSL (start_tls)
-            # 这比关闭再重连更高效，且能验证该端口确实支持 SSL
-            start_ssl = time.time()
-            await asyncio.wait_for(
-                writer.start_tls(ssl_ctx, server_hostname=sni),
-                timeout=SSL_TIMEOUT
-            )
-            ssl_handshake_latency = (time.time() - start_ssl) * 1000
-            
-            # 计算总延迟 (TCP建连 + SSL握手)
-            total_latency = tcp_latency + ssl_handshake_latency
-            
-            # 安全关闭
-            writer.close()
-            try: await writer.wait_closed()
-            except: pass
-            
-            # 查询地理位置并在原名称后面追加归属地速度 (采用异步调用防止阻塞)
+            # 查询地理位置
             cc = await get_country_code_async(host)
             
-            # [深度修复 3] 正则清除旧的测速和地区后缀 (例如清理多余的 -UNK1854ms-FR100ms)
+            # 正则清除旧的测速和地区后缀
             def clean_remark(name):
-                # 匹配末尾连续出现的一个或多个 -[大写字母2到3位][数字]ms 模式并剔除
-                return re.sub(r'(?:-[A-Za-z]{2,3}\d+ms)+$', '', str(name))
+                return re.sub(r'(?:-[A-Za-z]{2,3}(?:\d+ms|UDP))+$', '', str(name))
+            
+            # UDP 节点打上特殊标签，TCP 节点显示实际延迟
+            latency_str = "UDP" if is_udp else f"{total_latency:.0f}ms"
             
             new_link = link
             if link.startswith("vmess://"):
                 try:
-                    conf = json.loads(NodeParser.safe_base64_decode(link[8:]))
-                    # 清理旧名称，防止无限叠加
+                    # [深度修复 1] 重组写入时，依然要先剥离可能的尾巴
+                    b64_core = link[8:].split('#')[0]
+                    conf = json.loads(NodeParser.safe_base64_decode(b64_core))
                     clean_ps = clean_remark(conf.get("ps", ""))
-                    # 追加最新的归属地和速度
-                    conf["ps"] = f"{clean_ps}-{cc}{total_latency:.0f}ms"
+                    conf["ps"] = f"{clean_ps}-{cc}{latency_str}"
                     new_link = "vmess://" + base64.b64encode(json.dumps(conf, separators=(',', ':')).encode('utf-8')).decode('utf-8')
                 except Exception:
-                    # JSON 解析失败时的回退处理
                     parts = link.split("#", 1)
                     original_name = unquote(parts[1]) if len(parts) > 1 else ""
                     clean_name = clean_remark(original_name)
-                    new_remark = f"{clean_name}-{cc}{total_latency:.0f}ms"
+                    new_remark = f"{clean_name}-{cc}{latency_str}"
                     new_link = parts[0] + "#" + quote(new_remark)
             else:
-                # 处理通用 URI 协议 (Trojan, VLESS, SS等)
                 parts = link.split("#", 1)
                 original_name = unquote(parts[1]) if len(parts) > 1 else ""
                 clean_name = clean_remark(original_name)
-                new_remark = f"{clean_name}-{cc}{total_latency:.0f}ms"
+                new_remark = f"{clean_name}-{cc}{latency_str}"
                 new_link = parts[0] + "#" + quote(new_remark)
 
-            # 返回结果 (返回带地区和延迟的新链接)
             return (new_link, total_latency, f"{host}:{port}")
 
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError, ssl.SSLError):
-            # 任何阶段失败 (TCP连不上 或 SSL握手失败) 都视为无效
             if writer:
                 try:
                     writer.close()
                 except: pass
             return None
         except Exception as e:
-            # 消除吞没异常风险，改为安全的日志记录
             logger.debug(f"节点检测发生内部异常 {host}:{port} - {type(e).__name__}: {str(e)}")
             if writer:
                 try: writer.close()
@@ -270,7 +287,7 @@ async def main():
         print(f"错误: 找不到 {INPUT_FILE}")
         return
 
-    # 1. 读取节点 (使用 utf-8-sig 安全剥离隐蔽的 Windows BOM 头)
+    # 1. 读取节点
     with open(INPUT_FILE, 'r', encoding='utf-8-sig') as f:
         raw_lines = [line.strip() for line in f if line.strip()]
     unique_nodes = list(set(raw_lines))
@@ -299,18 +316,18 @@ async def main():
         if checked_count % 20 == 0 or checked_count == total:
             elapsed = time.time() - start_time
             speed = checked_count / elapsed if elapsed > 0 else 0
-            sys.stdout.write(f"\r进度: {checked_count}/{total} | 存活(TLS): {len(valid_nodes)} | 速度: {speed:.1f}/s")
+            sys.stdout.write(f"\r进度: {checked_count}/{total} | 存活(TLS/UDP): {len(valid_nodes)} | 速度: {speed:.1f}/s")
             sys.stdout.flush()
 
     print("\n")
     
-    # 3. 排序 (延迟低优先)
+    # 3. 排序 (延迟低优先，Hysteria2 的 0 延迟会排在最优质档位)
     valid_nodes.sort(key=lambda x: x[1])
     
-    # 截取前 MAX_NODES 个最优节点，严格控制输出文件大小
+    # 截取前 MAX_NODES 个最优节点
     final_links = [x[0] for x in valid_nodes][:MAX_NODES]
     
-    # 4. 保存 (输出文件继续使用标准的 utf-8 即可)
+    # 4. 保存
     try:
         with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
             f.write("\n".join(final_links))
@@ -320,9 +337,9 @@ async def main():
             f.write(b64_content)
             
         print(f"筛选完成，耗时 {time.time() - start_time:.2f}s")
-        print(f"检测存活 TLS 节点: {len(valid_nodes)} 个，根据策略保留最优的 {len(final_links)} 个")
+        print(f"检测存活节点: {len(valid_nodes)} 个，根据策略保留最优的 {len(final_links)} 个")
         if valid_nodes:
-            print(f"最优节点延迟: {valid_nodes[0][1]:.2f}ms")
+            print(f"最优节点延迟: {valid_nodes[0][1]:.2f}ms (UDP 显示 0ms)")
         print(f"结果已保存至 {OUTPUT_FILE}")
         
     except Exception as e:
