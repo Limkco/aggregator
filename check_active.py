@@ -52,6 +52,9 @@ CONCURRENCY = 200
 TCP_TIMEOUT = 2    # TCP 连接超时 (快速筛选)
 SSL_TIMEOUT = 3    # SSL 握手超时 (验证可用性)
 
+# [深度修复 2] 预编译标准 UUID 正则，用于拦截非法格式的 VLESS/VMess 节点
+UUID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
 # --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +94,11 @@ class NodeParser:
                     b64_str = link[8:]
                     json_str = NodeParser.safe_base64_decode(b64_str)
                     conf = json.loads(json_str)
+                    
+                    # [深度拦截] 拦截格式非法的伪造 UUID
+                    if not UUID_PATTERN.match(str(conf.get("id", ""))):
+                        return None, None, None, False
+                        
                     host = conf.get("add")
                     port = conf.get("port")
                     # 严格筛选 TLS
@@ -120,11 +128,17 @@ class NodeParser:
             else:
                 try:
                     parsed = urlparse(link)
+                    scheme = parsed.scheme.lower()
+                    
+                    # [深度拦截] VLESS 的 username 必须是合法 UUID
+                    if scheme == "vless":
+                        if not UUID_PATTERN.match(str(parsed.username or "")):
+                            return None, None, None, False
+                            
                     host = parsed.hostname
                     port = parsed.port
                     qs = parse_qs(parsed.query)
                     security = qs.get("security", [""])[0]
-                    scheme = parsed.scheme.lower()
                     
                     # Trojan
                     if scheme == "trojan":
@@ -202,26 +216,33 @@ async def check_connectivity(link, semaphore):
             # 查询地理位置并在原名称后面追加归属地速度 (采用异步调用防止阻塞)
             cc = await get_country_code_async(host)
             
+            # [深度修复 3] 正则清除旧的测速和地区后缀 (例如清理多余的 -UNK1854ms-FR100ms)
+            def clean_remark(name):
+                # 匹配末尾连续出现的一个或多个 -[大写字母2到3位][数字]ms 模式并剔除
+                return re.sub(r'(?:-[A-Za-z]{2,3}\d+ms)+$', '', str(name))
+            
             new_link = link
             if link.startswith("vmess://"):
                 try:
                     conf = json.loads(NodeParser.safe_base64_decode(link[8:]))
-                    # 获取原名称
-                    original_ps = conf.get("ps", "")
-                    # 在原名称后追加 -归属地速度
-                    conf["ps"] = f"{original_ps}-{cc}{total_latency:.0f}ms"
+                    # 清理旧名称，防止无限叠加
+                    clean_ps = clean_remark(conf.get("ps", ""))
+                    # 追加最新的归属地和速度
+                    conf["ps"] = f"{clean_ps}-{cc}{total_latency:.0f}ms"
                     new_link = "vmess://" + base64.b64encode(json.dumps(conf, separators=(',', ':')).encode('utf-8')).decode('utf-8')
                 except Exception:
                     # JSON 解析失败时的回退处理
                     parts = link.split("#", 1)
                     original_name = unquote(parts[1]) if len(parts) > 1 else ""
-                    new_remark = f"{original_name}-{cc}{total_latency:.0f}ms"
+                    clean_name = clean_remark(original_name)
+                    new_remark = f"{clean_name}-{cc}{total_latency:.0f}ms"
                     new_link = parts[0] + "#" + quote(new_remark)
             else:
                 # 处理通用 URI 协议 (Trojan, VLESS, SS等)
                 parts = link.split("#", 1)
                 original_name = unquote(parts[1]) if len(parts) > 1 else ""
-                new_remark = f"{original_name}-{cc}{total_latency:.0f}ms"
+                clean_name = clean_remark(original_name)
+                new_remark = f"{clean_name}-{cc}{total_latency:.0f}ms"
                 new_link = parts[0] + "#" + quote(new_remark)
 
             # 返回结果 (返回带地区和延迟的新链接)
