@@ -80,6 +80,7 @@ jobs:
         path: nodes.txt
         retention-days: 1
         overwrite: true
+        if-no-files-found: error
 
   # --- 第二阶段：合并、清洗与测试 ---
   check_active:
