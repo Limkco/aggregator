@@ -512,18 +512,21 @@ class NodeAggregator:
 
     def _save_results(self):
         logger.info(f"=== 最终统计: 共获取 {len(self.nodes)} 个唯一节点 ===")
-        if not self.nodes:
-            logger.warning("结果为空，未生成文件")
-            return
-
-        plain_text = "\n".join(self.nodes)
         
-        # 保存明文
+        # 无论结果是否为空，都预先生成内容（空结果则为空字符串）
+        plain_text = "\n".join(self.nodes) if self.nodes else ""
+        
+        # 始终保存明文 nodes.txt，防止 GitHub Actions 工作流因找不到文件而报错
         try:
             with open(RAW_OUTPUT_FILE, 'w', encoding='utf-8') as f:
                 f.write(plain_text)
         except Exception as e:
             logger.error(f"保存明文失败: {e}")
+
+        # 如果没有节点，在生成空明文文件后即可退出，不生成 Base64 文件
+        if not self.nodes:
+            logger.warning("结果为空，仅生成了空的明文文件")
+            return
 
         # 保存 Base64
         try:
