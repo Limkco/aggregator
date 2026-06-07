@@ -27,7 +27,7 @@ except ImportError:
 KEYWORDS: List[str] = [
     "proxies", "clash", "subscription", "vmess://", "vless://", 
     "trojan://", "shadowsocks", "hysteria2", "sub", "config",  "hy://",
-    "v2ray", "ss://", "节点", "机场", "翻墙"
+    "v2ray", "ss://","tuic", "节点", "机场", "翻墙"
 ]
 
 # 文件后缀：包含 yml 以覆盖更多 Clash 配置
