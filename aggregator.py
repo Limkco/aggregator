@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""Node aggregator: search GitHub for proxy configs, extract & deduplicate nodes."""
+
 import os
 import re
 import base64
@@ -7,7 +10,7 @@ import random
 import logging
 import threading
 import queue
-import hashlib # 用于特征哈希计算
+import hashlib
 from urllib.parse import quote, urlparse, parse_qs
 from typing import List, Set, Dict, Any, Optional, Union
 
@@ -15,86 +18,62 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 尝试导入 PyYAML，如果未安装则降级处理
 try:
     import yaml
 except ImportError:
     yaml = None
 
-# --- 配置部分 ---
-
-# 关键词列表：已优化，保留高价值关键词，移除冗余项以节省请求次数
-KEYWORDS: List[str] = [
-    "proxies", "clash", "subscription", "vmess://", "vless://", 
-    "trojan://", "shadowsocks", "hysteria2", "sub", "config",  "hy://",
-    "v2ray", "ss://","tuic", "节点", "机场", "翻墙"
+# ---------- Config ----------
+KEYWORDS_GROUPS: List[List[str]] = [
+    ["vmess://", "vless://", "trojan://"],
+    ["ss://", "shadowsocks", "hysteria2", "hy://"],
+    ["proxies", "clash", "subscription", "sub"],
+    ["v2ray", "config", "节点", "机场", "翻墙"],
 ]
-
-# 文件后缀：包含 yml 以覆盖更多 Clash 配置
-EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
-
-MAX_PAGES: int = 3            # 每个关键词搜索的页数
-SEARCH_INTERVAL: float = 3.0  # 搜索请求的基础间隔(秒)，配合重试机制使用
-MAX_EXECUTION_TIME: int = 1800 # 全局最大运行时间 (1小时)
-TIMEOUT: int = 10             # 单个文件下载超时时间 (秒)
-DOWNLOAD_WORKERS: int = 10    # 下载线程数 (设置为10以降低并发风控风险)
-
+EXTENSIONS: List[str] = ["yaml", "yml", "txt"]
+MAX_PAGES: int = 2
+SEARCH_INTERVAL: float = 2.5
+MAX_EXECUTION_TIME: int = 1500
+TIMEOUT: int = 8
+DOWNLOAD_WORKERS: int = 12
+TARGET_NODES: int = 8000          # early stop when reached
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
-# [终极修复] 增强型宽泛正则：直接匹配到空白符或尖括号结束
-# 彻底解决包含 {}, "", '' 等特殊字符的 xhttp extra JSON 参数被截断的问题
-LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>]+')
+LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\']+')
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
 
 class NodeAggregator:
     def __init__(self, token: Optional[str]):
         self.github_token = token
         self.nodes: Set[str] = set()
-        self.seen_hashes: Set[str] = set() # 用于特征值去重的哈希集合
-        self.nodes_lock = threading.Lock() # 线程锁，保护集合写入安全
-        
-        # 初始化 Session (包含连接池优化)
+        self.seen_hashes: Set[str] = set()
+        self.content_hashes: Set[str] = set()
+        self.nodes_lock = threading.Lock()
         self.session = self._init_session()
         self._setup_headers()
-        
         self.start_time = time.time()
-        self.should_stop = False # 全局停止标志
-        
-        # 任务队列 (生产者-消费者模型核心)
-        self.url_queue = queue.Queue()
-        
-        # 策略调整
-        if token:
-            self.sleep_interval = SEARCH_INTERVAL
-        else:
-            self.sleep_interval = 15.0 # 无 Token 必须非常慢
-            logger.warning("未检测到 Token，将使用极低速模式 (15s/req) 以免被封锁")
-
+        self.should_stop = False
+        self.url_queue: queue.Queue = queue.Queue()
+        self.sleep_interval = SEARCH_INTERVAL if token else 12.0
+        if not token:
+            logger.warning("No GH_TOKEN, using slow mode (12s/req)")
         if not yaml:
-            logger.warning("未检测到 PyYAML 库，YAML 解析功能将不可用。建议安装 PyYAML。")
+            logger.warning("PyYAML missing, YAML parsing disabled")
 
     def _init_session(self) -> requests.Session:
-        """初始化 Session，显式设置连接池大小以消除 'Connection pool is full' 警告"""
         session = requests.Session()
-        retry = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET"]
-        )
-        # 确保每个线程都有独立的连接可用，无需频繁建立/关闭 TCP 连接
-        adapter = HTTPAdapter(
-            max_retries=retry,
-            pool_connections=DOWNLOAD_WORKERS, 
-            pool_maxsize=DOWNLOAD_WORKERS
-        )
+        retry = Retry(total=3, backoff_factor=0.8, status_forcelist=[500, 502, 503, 504],
+                      allowed_methods=["GET"])
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=DOWNLOAD_WORKERS,
+                              pool_maxsize=DOWNLOAD_WORKERS)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
@@ -102,102 +81,77 @@ class NodeAggregator:
     def _setup_headers(self) -> None:
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (compatible; NodeAggregator/2.0)",
         })
         if self.github_token:
             self.session.headers["Authorization"] = f"token {self.github_token}"
-            logger.info("GitHub Token 已加载")
+            logger.info("GitHub Token loaded")
 
     def check_timeout(self) -> bool:
-        """检查是否达到最大执行时间"""
-        if time.time() - self.start_time > MAX_EXECUTION_TIME:
-            return True
-        return False
+        return time.time() - self.start_time > MAX_EXECUTION_TIME
 
     def safe_base64_decode(self, text: str) -> Optional[str]:
-        """安全的 Base64 解码，处理 URL 安全字符和填充"""
         if not text:
             return None
-        text = text.strip().replace(' ', '').replace('\n', '').replace('\r', '')
-        text = text.replace('-', '+').replace('_', '/')
-        padding = len(text) % 4
-        if padding > 0:
-            text += '=' * (4 - padding)
+        text = text.strip().replace(" ", "").replace("\n", "").replace("\r", "")
+        text = text.replace("-", "+").replace("_", "/")
+        pad = len(text) % 4
+        if pad:
+            text += "=" * (4 - pad)
         try:
-            return base64.b64decode(text).decode('utf-8', errors='ignore')
+            return base64.b64decode(text).decode("utf-8", errors="ignore")
         except Exception:
             return None
 
-    # --- 核心特征值生成（优化项 1：去重逻辑） ---
     def _get_node_hash(self, link: str) -> str:
-        """剥离名称备注等冗余信息，优先按 SNI/Host 进行哈希去重，无 SNI 时回退到核心参数"""
         link = link.strip()
         if "://" not in link:
-            return hashlib.md5(link.encode('utf-8')).hexdigest()
-        
-        # --- 提取 SNI/Host 作为唯一标识 ---
+            return hashlib.md5(link.encode()).hexdigest()
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
-            
             sni = None
             if protocol == "vmess":
-                # 剥离畸形备注，防止解码崩溃导致去重降级
-                b64_core = rest.split('#')[0]
-                decoded = self.safe_base64_decode(b64_core)
+                b64 = rest.split("#")[0]
+                decoded = self.safe_base64_decode(b64)
                 if decoded:
                     conf = json.loads(decoded)
-                    # vmess 的 sni 优先级：sni -> host -> add
                     sni = conf.get("sni") or conf.get("host") or conf.get("add")
             else:
                 parsed = urlparse(link)
                 qs = parse_qs(parsed.query)
-                # URI 协议的 sni 优先级：sni参数 -> peer参数 -> hostname
-                sni = qs.get("sni", [None])[0] or qs.get("peer", [None])[0]
+                sni = (qs.get("sni") or qs.get("peer") or [None])[0]
                 if not sni:
                     sni = parsed.hostname
-                # 兼容未带标准认证头（@）的特殊情况（如部分旧版 ss）
-                if not sni and '@' in rest:
-                    body = rest.split('#')[0]
-                    part_host = body.split('@')[-1]
-                    
-                    # 剥离混淆插件参数并安全处理 IPv6，防止提取错乱
-                    part_host = part_host.split('/?')[0].split('?')[0]
-                    if part_host.startswith('['):
-                        sni = part_host.rsplit(':', 1)[0].strip('[]')
+                if not sni and "@" in rest:
+                    body = rest.split("#")[0]
+                    part = body.split("@")[-1].split("/?")[0].split("?")[0]
+                    if part.startswith("["):
+                        sni = part.rsplit(":", 1)[0].strip("[]")
                     else:
-                        sni = part_host.rsplit(':', 1)[0]
-                    
+                        sni = part.rsplit(":", 1)[0]
             if sni:
-                return hashlib.md5(f"sni_{sni}".encode('utf-8')).hexdigest()
+                return hashlib.md5(f"sni_{sni}".encode()).hexdigest()
         except Exception:
             pass
-
-        # --- 回退：如果提取不到 SNI，退回对核心连接参数进行哈希 ---
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
-            
-            # vmess 需要解密 base64 后剔除 'ps' (备注) 字段
             if protocol == "vmess":
-                b64_core = rest.split('#')[0]
-                decoded = self.safe_base64_decode(b64_core)
+                b64 = rest.split("#")[0]
+                decoded = self.safe_base64_decode(b64)
                 if decoded:
                     conf = json.loads(decoded)
-                    conf.pop("ps", None) 
-                    conf_str = json.dumps(conf, sort_keys=True)
-                    return hashlib.md5(f"vmess://{conf_str}".encode('utf-8')).hexdigest()
-            
-            # 其他协议直接去除 # 后面的备注信息
+                    conf.pop("ps", None)
+                    return hashlib.md5(f"vmess://{json.dumps(conf, sort_keys=True)}".encode()).hexdigest()
             core = rest.split("#")[0]
-            return hashlib.md5(f"{protocol}://{core}".encode('utf-8')).hexdigest()
+            return hashlib.md5(f"{protocol}://{core}".encode()).hexdigest()
         except Exception:
-            return hashlib.md5(link.encode('utf-8')).hexdigest()
+            return hashlib.md5(link.encode()).hexdigest()
 
     def _build_vmess_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将字典配置转换为 vmess:// 标准链接"""
         try:
-            v2ray_json = {
+            v = {
                 "v": "2",
                 "ps": str(config.get("name", "unnamed")),
                 "add": str(config.get("server")),
@@ -209,335 +163,238 @@ class NodeAggregator:
                 "type": str(config.get("type", "none")),
                 "host": str(config.get("servername") or config.get("ws-opts", {}).get("headers", {}).get("Host", "")),
                 "path": str(config.get("ws-path") or config.get("ws-opts", {}).get("path", "")),
-                "tls": "tls" if config.get("tls") else ""
+                "tls": "tls" if config.get("tls") else "",
             }
-            if not v2ray_json["add"] or not v2ray_json["id"]:
+            if not v["add"] or not v["id"]:
                 return None
-            json_str = json.dumps(v2ray_json, separators=(',', ':'))
-            b64_str = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
-            return f"vmess://{b64_str}"
+            return "vmess://" + base64.b64encode(
+                json.dumps(v, separators=(",", ":")).encode()
+            ).decode()
         except Exception:
             return None
 
     def _build_ss_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将字典配置转换为 ss:// 标准链接"""
         try:
-            server = config.get("server")
-            port = config.get("port")
-            password = config.get("password")
-            method = config.get("cipher")
-            name = config.get("name", "ss_node")
-            if not (server and port and password and method):
+            server, port, password, method = (
+                config.get("server"), config.get("port"),
+                config.get("password"), config.get("cipher")
+            )
+            if not all([server, port, password, method]):
                 return None
-            user_info = f"{method}:{password}"
-            b64_user_info = base64.b64encode(user_info.encode('utf-8')).decode('utf-8').strip()
-            safe_name = quote(str(name))
-            return f"ss://{b64_user_info}@{server}:{port}#{safe_name}"
+            user = base64.b64encode(f"{method}:{password}".encode()).decode().strip()
+            return f"ss://{user}@{server}:{port}#{quote(str(config.get('name', 'ss')))}"
         except Exception:
             return None
 
     def _build_trojan_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将字典配置转换为 trojan:// 标准链接"""
         try:
-            server = config.get("server")
-            port = config.get("port")
-            password = config.get("password")
-            name = config.get("name", "trojan_node")
-            sni = config.get("sni") or config.get("servername")
-            if not (server and port and password):
+            server, port, password = config.get("server"), config.get("port"), config.get("password")
+            if not all([server, port, password]):
                 return None
-            query = f"?peer={sni}" if sni else ""
-            safe_name = quote(str(name))
-            return f"trojan://{password}@{server}:{port}{query}#{safe_name}"
+            sni = config.get("sni") or config.get("servername")
+            q = f"?peer={sni}" if sni else ""
+            return f"trojan://{password}@{server}:{port}{q}#{quote(str(config.get('name', 'trojan')))}"
         except Exception:
             return None
 
-    def _parse_structured_node(self, proxy_item: Dict[str, Any]) -> Optional[str]:
-        """根据协议类型分发处理"""
-        if not isinstance(proxy_item, dict):
+    def _parse_structured_node(self, item: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(item, dict):
             return None
-        protocol = str(proxy_item.get("type", "")).lower()
-        if protocol == "vmess":
-            return self._build_vmess_link(proxy_item)
-        elif protocol in ["ss", "shadowsocks"]:
-            return self._build_ss_link(proxy_item)
-        elif protocol == "trojan":
-            return self._build_trojan_link(proxy_item)
+        proto = str(item.get("type", "")).lower()
+        if proto == "vmess":
+            return self._build_vmess_link(item)
+        if proto in ("ss", "shadowsocks"):
+            return self._build_ss_link(item)
+        if proto == "trojan":
+            return self._build_trojan_link(item)
         return None
 
-    def _extract_from_structured_data(self, data: Union[Dict, List]) -> List[str]:
-        """从 JSON/YAML 数据结构中提取节点"""
-        extracted = []
-        proxy_list = []
-        # 1. Clash 格式
-        if isinstance(data, dict) and "proxies" in data and isinstance(data["proxies"], list):
-            proxy_list = data["proxies"]
-        # 2. 纯列表格式
+    def _extract_from_structured(self, data: Union[Dict, List]) -> List[str]:
+        proxies = []
+        if isinstance(data, dict) and isinstance(data.get("proxies"), list):
+            proxies = data["proxies"]
         elif isinstance(data, list):
-            proxy_list = data
-        
-        for item in proxy_list:
-            link = self._parse_structured_node(item)
-            if link:
-                extracted.append(link)
-        return extracted
+            proxies = data
+        return [n for item in proxies if (n := self._parse_structured_node(item))]
 
     def extract_nodes(self, text: str) -> List[str]:
         if not text:
             return []
-            
-        def clean_node(match: str) -> str:
-            """智能括号平衡清洗算法：防止正则剥离 xhttp extra 内部有效的 } 导致 JSON 崩塌"""
-            while match and match[-1] in ('}', ']', ')', '>', '"', "'", ',', ';'):
-                if match[-1] == '}':
-                    if match.count('{') < match.count('}'): 
-                        match = match[:-1]
-                    else: 
-                        break
-                elif match[-1] == ']':
-                    if match.count('[') < match.count(']'): 
-                        match = match[:-1]
-                    else: 
-                        break
-                elif match[-1] == ')':
-                    if match.count('(') < match.count(')'): 
-                        match = match[:-1]
-                    else: 
-                        break
-                else:
-                    match = match[:-1]
-            return match
 
-        found_nodes = []
-        
-        # --- 策略 1: 结构化优先提取 (获取最纯净、无编码污染的配置) ---
-        text_stripped = text.strip()
-        is_json_like = text_stripped.startswith('{') or text_stripped.startswith('[')
-        is_yaml_like = "proxies:" in text_stripped or "name:" in text_stripped
+        def clean(m: str) -> str:
+            while m and m[-1] in ")]}>\"',;":
+                if m[-1] == "}" and m.count("{") >= m.count("}"):
+                    break
+                if m[-1] == "]" and m.count("[") >= m.count("]"):
+                    break
+                if m[-1] == ")" and m.count("(") >= m.count(")"):
+                    break
+                m = m[:-1]
+            return m
 
-        parsed_data = None
-        
-        # 3.1 尝试 JSON
-        if is_json_like:
+        found: List[str] = []
+        stripped = text.strip()
+        parsed = None
+        if stripped.startswith(("{", "[")):
             try:
-                parsed_data = json.loads(text_stripped)
+                parsed = json.loads(stripped)
             except json.JSONDecodeError:
                 pass
-        
-        # 3.2 尝试 YAML
-        if parsed_data is None and is_yaml_like and yaml:
+        if parsed is None and ("proxies:" in stripped or "name:" in stripped) and yaml:
             try:
-                parsed_data = yaml.safe_load(text_stripped)
+                parsed = yaml.safe_load(stripped)
             except Exception:
                 pass
-        
-        # 3.3 提取结构化数据
-        if parsed_data:
-            structured_nodes = self._extract_from_structured_data(parsed_data)
-            if structured_nodes:
-                found_nodes.extend(structured_nodes)
-                
-        # --- [核心修复] 深度清洗各类转义字符，防 pbk 和 extra 断裂 ---
-        text_clean = text.replace('&amp;', '&').replace('\\u0026', '&').replace('\\/', '/').replace('\\"', '"').replace('\\\\', '\\')
-        
-        # --- 策略 2: 宽泛正则直接提取 ---
-        raw_matches = LINK_PATTERN.findall(text_clean)
-        for match in raw_matches:
-            found_nodes.append(clean_node(match))
-            
-        # --- 策略 3: Base64 解码后正则提取 ---
+        if parsed:
+            found.extend(self._extract_from_structured(parsed))
+
+        clean_text = (text.replace("&amp;", "&").replace("\\u0026", "&")
+                      .replace("\\/", "/").replace('\\"', '"').replace("\\\\", "\\"))
+        found.extend(clean(m) for m in LINK_PATTERN.findall(clean_text))
+
         decoded = self.safe_base64_decode(text)
         if decoded:
-            decoded_clean = decoded.replace('&amp;', '&').replace('\\u0026', '&').replace('\\/', '/').replace('\\"', '"').replace('\\\\', '\\')
-            decoded_matches = LINK_PATTERN.findall(decoded_clean)
-            for match in decoded_matches:
-                found_nodes.append(clean_node(match))
-                
-        # 初筛：过滤太短的无效字符串
-        return [node for node in found_nodes if len(node) > 15]
+            d_clean = (decoded.replace("&amp;", "&").replace("\\u0026", "&")
+                       .replace("\\/", "/").replace('\\"', '"').replace("\\\\", "\\"))
+            found.extend(clean(m) for m in LINK_PATTERN.findall(d_clean))
 
-    def fetch_worker(self):
-        """消费者线程：从队列获取URL并下载解析"""
+        return [n for n in found if len(n) > 15]
+
+    def fetch_worker(self) -> None:
         while not self.should_stop:
             try:
-                # 阻塞等待，每秒检查一次停止标志
-                url = self.url_queue.get(timeout=1) 
+                url = self.url_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            
             try:
                 resp = self.session.get(url, timeout=TIMEOUT)
-                if resp.status_code == 200:
-                    # 调用完整的提取逻辑
-                    nodes = self.extract_nodes(resp.text)
-                    if nodes:
-                        with self.nodes_lock:
-                            count_before = len(self.nodes)
-                            for node in nodes:
-                                # 阻挡无效长度和无协议头的畸形数据
-                                if len(node) < 15 or "://" not in node:
-                                    continue
-                                    
-                                # 应用哈希去重逻辑
-                                node_hash = self._get_node_hash(node)
-                                if node_hash not in self.seen_hashes:
-                                    self.seen_hashes.add(node_hash)
-                                    self.nodes.add(node)
-                            # 简单的进度展示
-                            if len(self.nodes) > count_before and len(self.nodes) % 50 == 0:
-                                logger.info(f"当前库存: {len(self.nodes)} 个唯一节点")
+                if resp.status_code != 200:
+                    continue
+                content = resp.content
+                c_hash = hashlib.md5(content).hexdigest()
+                with self.nodes_lock:
+                    if c_hash in self.content_hashes:
+                        continue
+                    self.content_hashes.add(c_hash)
+                nodes = self.extract_nodes(content.decode("utf-8", errors="ignore"))
+                if not nodes:
+                    continue
+                with self.nodes_lock:
+                    before = len(self.nodes)
+                    for node in nodes:
+                        if len(node) < 15 or "://" not in node:
+                            continue
+                        h = self._get_node_hash(node)
+                        if h not in self.seen_hashes:
+                            self.seen_hashes.add(h)
+                            self.nodes.add(node)
+                    if len(self.nodes) > before and len(self.nodes) % 100 == 0:
+                        logger.info(f"Unique nodes: {len(self.nodes)}")
+                    if len(self.nodes) >= TARGET_NODES:
+                        self.should_stop = True
             except Exception:
                 pass
             finally:
                 self.url_queue.task_done()
 
-    def search_producer(self):
-        """生产者线程：执行搜索并将结果推入队列"""
-        logger.info(f"开始搜索 GitHub, 关键词队列: {len(KEYWORDS)} 个")
-        random.shuffle(KEYWORDS) # 打乱顺序
-        
-        consecutive_limit_hits = 0 # 连续风控计数器
-
-        for keyword in KEYWORDS:
-            if self.should_stop: break
-            
+    def search_producer(self) -> None:
+        logger.info(f"Start search, {len(KEYWORDS_GROUPS)} groups")
+        consecutive_limits = 0
+        for group in KEYWORDS_GROUPS:
+            if self.should_stop:
+                break
+            kw_part = " OR ".join(f'"{k}"' if "://" in k else k for k in group)
             for ext in EXTENSIONS:
-                if self.should_stop: break
-                
-                # 标记：当前关键词+后缀组合是否找到了结果
-                found_items_in_this_combo = False
-                
+                if self.should_stop:
+                    break
+                found_any = False
                 for page in range(1, MAX_PAGES + 1):
-                    if self.should_stop: break
-                    if self.check_timeout():
-                        logger.warning("达到最大执行时间，停止搜索")
+                    if self.should_stop or self.check_timeout():
                         self.should_stop = True
+                        logger.warning("Timeout or target reached, stop search")
                         return
-
-                    query = f"{keyword} extension:{ext}"
-                    api_url = f"https://api.github.com/search/code?q={query}&per_page=20&page={page}&sort=indexed&order=desc"
-                    
-                    # 智能重试循环 (防止丢失数据)
-                    max_retries = 3
+                    query = f"{kw_part} extension:{ext}"
+                    api = (f"https://api.github.com/search/code?q={query}"
+                           f"&per_page=30&page={page}&sort=indexed&order=desc")
                     success = False
-                    
-                    for attempt in range(max_retries):
+                    for attempt in range(3):
                         try:
-                            resp = self.session.get(api_url)
-                            
-                            # 触发速率限制：原地等待并重试，绝不跳过
-                            if resp.status_code in [403, 429]:
-                                consecutive_limit_hits += 1
-                                
-                                # 连续4次风控则熔断
-                                if consecutive_limit_hits >= 4:
-                                    logger.warning("连续 4 次触发 API 速率限制，判定为高风险，停止搜索任务并进入后续处理...")
-                                    return 
-
-                                wait_time = 60 * (attempt + 1) # 第一次60s，第二次120s
-                                logger.warning(f"触发 API 速率限制，暂停 {wait_time} 秒后重试 (第 {attempt+1} 次)...")
-                                time.sleep(wait_time)
-                                continue 
-                            
+                            resp = self.session.get(api, timeout=15)
+                            if resp.status_code in (403, 429):
+                                consecutive_limits += 1
+                                if consecutive_limits >= 4:
+                                    logger.warning("Rate limit too frequent, stop search")
+                                    return
+                                wait = 45 * (attempt + 1)
+                                logger.warning(f"Rate limited, wait {wait}s (try {attempt+1})")
+                                time.sleep(wait)
+                                continue
                             if resp.status_code == 200:
-                                consecutive_limit_hits = 0 # 成功则重置计数
+                                consecutive_limits = 0
                                 items = resp.json().get("items", [])
-                                logger.info(f"搜索 [{query} P{page}] -> 找到 {len(items)} 个文件")
-                                
+                                logger.info(f"[{query[:60]}...] P{page} -> {len(items)} files")
                                 if items:
-                                    found_items_in_this_combo = True
-                                    for item in items:
-                                        html_url = item.get("html_url")
-                                        if html_url:
-                                            # 转换为 raw 链接
-                                            raw_url = html_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-                                            self.url_queue.put(raw_url)
-                                else:
-                                    pass 
-                                
+                                    found_any = True
+                                    for it in items:
+                                        html = it.get("html_url")
+                                        if html:
+                                            raw = html.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                                            self.url_queue.put(raw)
                                 success = True
-                                break # 成功，退出重试循环
-                            
-                            else:
-                                logger.error(f"API 错误 {resp.status_code}")
-                                break # 其他错误不重试
-                                
+                                break
+                            logger.error(f"API {resp.status_code}")
+                            break
                         except Exception as e:
-                            logger.error(f"搜索请求异常: {e}")
-                            time.sleep(5)
-                    
-                    # 动态随机休眠
-                    time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 1.0))
-                    
-                    if success and not found_items_in_this_combo:
-                         break
-                
-                pass 
+                            logger.error(f"Search error: {e}")
+                            time.sleep(3)
+                    time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 0.8))
+                    if success and not found_any:
+                        break
+        logger.info("Search finished")
 
-        logger.info("所有搜索任务已遍历完成")
-
-    def run(self):
-        # 1. 启动下载消费者线程
-        logger.info(f"启动 {DOWNLOAD_WORKERS} 个下载线程...")
-        threads = []
+    def run(self) -> None:
+        logger.info(f"Start {DOWNLOAD_WORKERS} download workers")
+        workers = []
         for _ in range(DOWNLOAD_WORKERS):
-            t = threading.Thread(target=self.fetch_worker)
-            t.daemon = True # 守护线程
+            t = threading.Thread(target=self.fetch_worker, daemon=True)
             t.start()
-            threads.append(t)
-        
-        # 2. 在主线程运行搜索生产者
+            workers.append(t)
         try:
             self.search_producer()
         except KeyboardInterrupt:
-            logger.warning("用户中断")
+            logger.warning("Interrupted")
             self.should_stop = True
-        
-        # 3. 等待队列清空
-        logger.info("搜索结束，等待剩余下载任务完成(最多30秒)...")
-        timeout_wait = time.time() + 30
-        while not self.url_queue.empty() and time.time() < timeout_wait:
-            time.sleep(1)
-        
-        self.should_stop = True # 通知所有线程退出
-        
-        # 4. 保存结果
+        logger.info("Waiting remaining downloads (max 25s)...")
+        deadline = time.time() + 25
+        while not self.url_queue.empty() and time.time() < deadline:
+            time.sleep(0.5)
+        self.should_stop = True
         self._save_results()
-        
-        # 优雅释放网络连接池资源
         try:
             self.session.close()
         except Exception:
             pass
 
-    def _save_results(self):
-        logger.info(f"=== 最终统计: 共获取 {len(self.nodes)} 个唯一节点 ===")
-        
-        # 无论结果是否为空，都预先生成内容（空结果则为空字符串）
-        plain_text = "\n".join(self.nodes) if self.nodes else ""
-        
-        # 始终保存明文 nodes.txt，防止 GitHub Actions 工作流因找不到文件而报错
+    def _save_results(self) -> None:
+        logger.info(f"=== Final unique nodes: {len(self.nodes)} ===")
+        plain = "\n".join(self.nodes) if self.nodes else ""
         try:
-            with open(RAW_OUTPUT_FILE, 'w', encoding='utf-8') as f:
-                f.write(plain_text)
+            with open(RAW_OUTPUT_FILE, "w", encoding="utf-8") as f:
+                f.write(plain)
         except Exception as e:
-            logger.error(f"保存明文失败: {e}")
-
-        # 如果没有节点，在生成空明文文件后即可退出，不生成 Base64 文件
+            logger.error(f"Save plain failed: {e}")
         if not self.nodes:
-            logger.warning("结果为空，仅生成了空的明文文件")
+            logger.warning("Empty result")
             return
-
-        # 保存 Base64
         try:
-            b64_content = base64.b64encode(plain_text.encode('utf-8')).decode('utf-8')
-            with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-                f.write(b64_content)
-            logger.info(f"结果已保存至 {OUTPUT_FILE} 和 {RAW_OUTPUT_FILE}")
+            b64 = base64.b64encode(plain.encode()).decode()
+            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                f.write(b64)
+            logger.info(f"Saved {OUTPUT_FILE} and {RAW_OUTPUT_FILE}")
         except Exception as e:
-            logger.error(f"保存 Base64 失败: {e}")
+            logger.error(f"Save base64 failed: {e}")
+
 
 if __name__ == "__main__":
     token = os.environ.get("GH_TOKEN")
-    aggregator = NodeAggregator(token)
-    aggregator.run()
+    NodeAggregator(token).run()
