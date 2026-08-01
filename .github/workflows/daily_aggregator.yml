@@ -2,187 +2,172 @@ name: Aggregator Daily Build
 
 on:
   schedule:
-    # 每5天 UTC 时间 0:00 运行 (北京时间 8:00)
+    # 每 10 天 UTC 0:00 运行（北京时间 8:00）
     - cron: '0 0 */10 * *'
   workflow_dispatch:
     inputs:
       force_crawl:
-        description: '强制重新爬取 (无视已存在的 raw-nodes)'
+        description: '强制重新爬取（无视已有 raw-nodes）'
         required: false
         type: boolean
         default: false
 
 permissions:
   contents: write
-  actions: read # 必须授予此权限，工作流才能使用 gh CLI 读取历史运行记录
+  actions: read
 
 jobs:
-  # --- 第一阶段：下载与聚合 ---
+  # ---------- 第一阶段：搜索与聚合 ----------
   fetch_raw:
     runs-on: ubuntu-latest
     outputs:
       skip_crawl: ${{ steps.check_artifact.outputs.skip_crawl }}
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@main
+      - name: Checkout
+        uses: actions/checkout@main
 
-    - name: Check and Restore Existing raw-nodes
-      id: check_artifact
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        if [ "${{ github.event.inputs.force_crawl }}" == "true" ]; then
-          echo "用户选择了强制重新爬取，跳过工件检查。"
-          echo "skip_crawl=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
+      - name: Check existing raw-nodes artifact
+        id: check_artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.force_crawl }}" = "true" ]; then
+            echo "Force crawl enabled, skip artifact restore."
+            echo "skip_crawl=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-        echo "正在检查历史记录中尚未过期的 'raw-nodes'..."
-        WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" | cut -d'@' -f1)
-        PREV_RUN_ID=$(gh run list --workflow "$WORKFLOW_FILE" --json databaseId --jq '[.[] | select(.databaseId != '${{ github.run_id }}')] | .[0].databaseId // empty' || echo "")
-        
-        if [ -n "$PREV_RUN_ID" ]; then
-          echo "找到上一次历史运行 ID: $PREV_RUN_ID"
-          if gh run download "$PREV_RUN_ID" -n raw-nodes --dir .; then
-            echo "成功下载未过期的 raw-nodes，将跳过本轮节点爬取！"
-            echo "skip_crawl=true" >> $GITHUB_OUTPUT
+          echo "Looking for previous raw-nodes artifact..."
+          WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" | cut -d'@' -f1)
+          PREV_RUN_ID=$(gh run list --workflow "$WORKFLOW_FILE" --json databaseId \
+            --jq '[.[] | select(.databaseId != ${{ github.run_id }})] | .[0].databaseId // empty' || true)
+
+          if [ -n "$PREV_RUN_ID" ]; then
+            echo "Previous run ID: $PREV_RUN_ID"
+            if gh run download "$PREV_RUN_ID" -n raw-nodes --dir . 2>/dev/null; then
+              echo "Restored raw-nodes, will skip crawl."
+              echo "skip_crawl=true" >> $GITHUB_OUTPUT
+            else
+              echo "Artifact expired or missing, need crawl."
+              echo "skip_crawl=false" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "上一次运行的 raw-nodes 已过期被清理或不存在，需要重新爬取。"
+            echo "No previous run found, need crawl."
             echo "skip_crawl=false" >> $GITHUB_OUTPUT
           fi
-        else
-          echo "未找到任何历史运行记录，需要重新爬取。"
-          echo "skip_crawl=false" >> $GITHUB_OUTPUT
-        fi
 
-    - name: Set up Python
-      if: steps.check_artifact.outputs.skip_crawl != 'true'
-      uses: actions/setup-python@main
-      with:
-        python-version: 'x'
+      - name: Setup Python
+        if: steps.check_artifact.outputs.skip_crawl != 'true'
+        uses: actions/setup-python@main
+        with:
+          python-version: '3.11'
 
-    - name: Install Dependencies
-      if: steps.check_artifact.outputs.skip_crawl != 'true'
-      run: |
-        pip install requests PyYAML
+      - name: Install dependencies
+        if: steps.check_artifact.outputs.skip_crawl != 'true'
+        run: pip install requests PyYAML
 
-    - name: Run Aggregator Script
-      if: steps.check_artifact.outputs.skip_crawl != 'true'
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        python aggregator.py
+      - name: Run aggregator
+        if: steps.check_artifact.outputs.skip_crawl != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python aggregator.py
 
-    - name: Upload Raw Artifact
-      uses: actions/upload-artifact@main
-      with:
-        name: raw-nodes
-        path: nodes.txt
-        retention-days: 1
-        overwrite: true
-        if-no-files-found: error
+      - name: Upload raw-nodes artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: raw-nodes
+          path: nodes.txt
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
 
-  # --- 第二阶段：合并、清洗与测试 ---
+  # ---------- 第二阶段：合并、过滤、测速、发布 ----------
   check_active:
     needs: fetch_raw
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@main
-      with:
-        fetch-depth: 0 
+      - name: Checkout
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
 
-    - name: Set up Python
-      uses: actions/setup-python@main
-      with:
-        python-version: 'x'
+      - name: Setup Python
+        uses: actions/setup-python@main
+        with:
+          python-version: '3.11'
 
-    - name: Download Raw Artifact
-      uses: actions/download-artifact@main
-      with:
-        name: raw-nodes
+      - name: Download raw-nodes
+        uses: actions/download-artifact@main
+        with:
+          name: raw-nodes
 
-    # --- [新增] 合并历史节点 ---
-    - name: Fetch Previous Release Nodes & Merge
-      run: |
-        echo "尝试获取 release 分支上一轮的有效节点..."
-        # 直接通过 raw 链接下载上一轮的结果，如果这是第一次运行报 404 也不影响主流程
-        if wget -qO previous_nodes.txt "https://raw.githubusercontent.com/${{ github.repository }}/release/nodes.txt"; then
-          echo "✅ 成功获取上一轮节点！"
-          if [ -f "merge_nodes.py" ]; then
+      - name: Merge with previous release nodes
+        run: |
+          echo "Fetching previous nodes from release branch..."
+          if wget -qO previous_nodes.txt \
+            "https://raw.githubusercontent.com/${{ github.repository }}/release/nodes.txt"; then
+            echo "Previous nodes downloaded."
             python merge_nodes.py
-            echo "✅ 历史节点与新节点合并去重完成。"
+            echo "Merge & dedup finished."
           else
-            echo "⚠️ 未找到 merge_nodes.py 脚本，跳过合并步骤。"
+            echo "No previous nodes (first run or missing), skip merge."
           fi
-        else
-          echo "ℹ️ 未找到上一轮节点文件 (可能是首次运行或 release 分支暂无数据)，跳过合并。"
-        fi
 
-    # --- [已存在] 关键字过滤阶段 ---
-    - name: Filter Nodes by Keywords
-      run: |
-        echo "开始执行关键字过滤..."
-        if [ -f "filter_nodes.py" ]; then
-          python filter_nodes.py
-          if [ -f "nodes_filtered.txt" ]; then
-            mv nodes_filtered.txt nodes.txt
-            echo "✅ 关键字过滤完成，已生成最新 nodes.txt"
-          fi
-        else
-          echo "⚠️ 未找到 filter_nodes.py 脚本，跳过关键字过滤阶段。"
-        fi
-
-    # --- 环境安装与测速 ---
-    - name: Install Environment & Update GeoIP Database
-      run: |
-        pip install maxminddb
-        
-        echo "尝试下载最新的 GeoLite2-Country 数据库..."
-        if wget -T 15 -qO temp_GeoLite2.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
-          echo "✅ 成功下载最新的 GeoIP 数据库。"
-          mv temp_GeoLite2.mmdb GeoLite2-Country.mmdb
-          cp GeoLite2-Country.mmdb geoip.mmdb
-          
-          if [ -n "$(git status --porcelain GeoLite2-Country.mmdb)" ]; then
-            echo "发现 GeoIP 数据库存在更新，正在将其同步推送回当前代码分支..."
-            git config --local user.email "action@github.com"
-            git config --local user.name "GitHub Action"
-            git add GeoLite2-Country.mmdb
-            git commit -m "Auto-update GeoLite2-Country.mmdb [skip ci]"
-            git push origin HEAD:${{ github.ref_name }}
-            echo "✅ 数据库代码库同步完成！"
+      - name: Filter by keywords
+        run: |
+          if [ -f filter_nodes.py ]; then
+            python filter_nodes.py
+            if [ -f nodes_filtered.txt ]; then
+              mv nodes_filtered.txt nodes.txt
+              echo "Keyword filter done."
+            fi
           else
-            echo "✅ 当前分支的数据库已是最新，无需执行 Git 提交。"
+            echo "filter_nodes.py not found, skip."
           fi
-        else
-          echo "⚠️ 下载最新 GeoIP 数据库失败或超时，开始启用本地回退策略！"
-          rm -f temp_GeoLite2.mmdb
-          if [ -f "GeoLite2-Country.mmdb" ]; then
+
+      - name: Install maxminddb & update GeoIP
+        run: |
+          pip install maxminddb
+          echo "Downloading latest GeoLite2-Country..."
+          if wget -T 15 -qO temp_geo.mmdb \
+            "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
+            mv temp_geo.mmdb GeoLite2-Country.mmdb
             cp GeoLite2-Country.mmdb geoip.mmdb
-            echo "✅ 成功提取当前分支中历史缓存的 GeoLite2-Country.mmdb 用于节点解析。"
+            if [ -n "$(git status --porcelain GeoLite2-Country.mmdb)" ]; then
+              git config --local user.email "action@github.com"
+              git config --local user.name "GitHub Action"
+              git add GeoLite2-Country.mmdb
+              git commit -m "Auto-update GeoLite2-Country.mmdb [skip ci]"
+              git push origin HEAD:${{ github.ref_name }}
+              echo "GeoIP database updated in repo."
+            else
+              echo "GeoIP already up-to-date."
+            fi
           else
-            echo "❌ 错误：本地也未找到 GeoLite2-Country.mmdb。"
+            echo "Download failed, fallback to local."
+            rm -f temp_geo.mmdb
+            if [ -f GeoLite2-Country.mmdb ]; then
+              cp GeoLite2-Country.mmdb geoip.mmdb
+              echo "Using local GeoLite2-Country.mmdb"
+            else
+              echo "WARNING: No GeoIP database available."
+            fi
           fi
-        fi
 
-    - name: Run Check Active Script
-      run: |
-        python check_active.py
+      - name: Run active check
+        run: python check_active.py
 
-    - name: Publish to Release Branch
-      run: |
-        mkdir -p publish_dir
-        cp sub.txt publish_dir/
-        cp nodes.txt publish_dir/
-        cd publish_dir
-        
-        git init
-        git checkout -b release
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        
-        git add .
-        git commit -m "Auto-update valid nodes [$(date)]" || exit 0
-        
-        git push --force "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" release
+      - name: Publish to release branch
+        run: |
+          mkdir -p publish_dir
+          cp sub.txt nodes.txt publish_dir/
+          cd publish_dir
+          git init
+          git checkout -b release
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git commit -m "Auto-update valid nodes [$(date -u +%Y-%m-%d)]" || exit 0
+          git push --force \
+            "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            release
