@@ -157,6 +157,9 @@ jobs:
       - name: Run active check
         run: python check_active.py
 
+      - name: Deep protocol check (max 10 min)
+        run: python deep_check.py
+
       - name: Publish to release branch
         run: |
           mkdir -p publish_dir
