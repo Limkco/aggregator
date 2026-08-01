@@ -1,159 +1,106 @@
+#!/usr/bin/env python3
+"""Filter nodes by blacklist keywords (name + deep payload)."""
+
 import os
 import json
 import base64
 from urllib.parse import unquote
 
-# --- 配置部分 ---
-INPUT_FILE = "nodes.txt"           # 输入的节点文件
-OUTPUT_FILE = "nodes_filtered.txt" # 过滤后输出的节点文件
-SUB_FILE = "sub_filtered.txt"      # 过滤后生成的 Base64 订阅文件
+INPUT_FILE = "nodes.txt"
+OUTPUT_FILE = "nodes_filtered.txt"
+SUB_FILE = "sub_filtered.txt"
 
-# 在这里设置你需要过滤的关键字（黑名单）
-# 例如过滤掉名字中带有"官网"、"剩余流量"、"到期"等说明性节点
-BLACKLIST_KEYWORDS = [
-    "官网", 
-    "剩余", 
-    "到期", 
-    "流量", 
-    "过期",
-    "套餐",
-    "hy",
-    "pages",
-    "Workers"
+BLACKLIST = [
+    "官网", "剩余", "到期", "流量", "过期", "套餐",
+    "hy", "pages", "Workers",
 ]
 
-def safe_base64_decode(text):
-    """安全的 Base64 解码，兼容现有的处理逻辑"""
+
+def safe_b64decode(text: str) -> str:
     if not text:
         return ""
-    text = text.strip().replace('-', '+').replace('_', '/')
-    padding = len(text) % 4
-    if padding > 0:
-        text += '=' * (4 - padding)
+    text = text.strip().replace("-", "+").replace("_", "/")
+    pad = len(text) % 4
+    if pad:
+        text += "=" * (4 - pad)
     try:
-        return base64.b64decode(text).decode('utf-8', errors='ignore')
+        return base64.b64decode(text).decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
-def get_node_name(link):
-    """
-    提取节点名称(备注)
-    支持 vmess 的 JSON 'ps' 字段解析
-    支持 ss/trojan/vless 等协议的 URL # 后缀解析
-    """
+
+def get_name(link: str) -> str:
     link = link.strip()
-    
-    # 1. 处理 VMess 协议
     if link.startswith("vmess://"):
         try:
-            # [深度修复 1] 强制剥离尾随的 #备注，防止 Base64 解码雪崩
-            b64_str = link[8:].split('#')[0]
-            json_str = safe_base64_decode(b64_str)
-            conf = json.loads(json_str)
-            return conf.get("ps", "")
+            b64 = link[8:].split("#")[0]
+            conf = json.loads(safe_b64decode(b64) or "{}")
+            return str(conf.get("ps", ""))
         except Exception:
             return ""
-            
-    # 2. 处理包含 '#' 的通用 URI 协议 (ss, trojan, vless, hysteria2 等)
-    elif "#" in link:
+    if "#" in link:
         try:
-            name_part = link.split("#", 1)[1]
-            # URL 解码，将 %20 等恢复为正常字符以便匹配
-            return unquote(name_part)
+            return unquote(link.split("#", 1)[1])
         except Exception:
             return ""
-            
     return ""
 
-def main():
-    print("--- 节点关键字过滤脚本 ---")
-    
+
+def get_payload(link: str) -> str:
+    """Extract deep content for blacklist matching."""
+    link = link.strip()
+    if link.startswith("vmess://"):
+        b64 = link[8:].split("#")[0]
+        return safe_b64decode(b64).lower()
+    if link.startswith("ss://"):
+        try:
+            body = link[5:].split("#")[0]
+            if "@" not in body:
+                return safe_b64decode(body).lower()
+            user = body.split("@", 1)[0]
+            return safe_b64decode(user).lower()
+        except Exception:
+            return ""
+    return ""
+
+
+def main() -> None:
+    print("--- Keyword filter ---")
     if not os.path.exists(INPUT_FILE):
-        print(f"错误: 找不到输入文件 {INPUT_FILE}")
+        print(f"Error: {INPUT_FILE} not found")
         return
 
-    # 使用 utf-8-sig 安全读取，剥离可能的 Windows BOM 头 (\ufeff)
-    with open(INPUT_FILE, 'r', encoding='utf-8-sig') as f:
-        raw_lines = [line.strip() for line in f if line.strip()]
-        
-    print(f"初始读取节点数: {len(raw_lines)}")
-    
-    valid_nodes = []
-    filtered_count = 0
+    with open(INPUT_FILE, "r", encoding="utf-8-sig") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    print(f"Input nodes: {len(lines)}")
 
-    # 将黑名单关键字统一转换为小写，预先处理以提高效率
-    lower_blacklist = [kw.lower() for kw in BLACKLIST_KEYWORDS]
+    blacklist = [kw.lower() for kw in BLACKLIST]
+    kept = []
+    filtered = 0
 
-    # 执行过滤逻辑
-    for link in raw_lines:
-        node_name = get_node_name(link)
-        
-        # 将提取出的节点名称和解码后的链接统一转换为小写
-        lower_node_name = node_name.lower()
-        lower_link = unquote(link).lower()
-        
-        # --- 提取深层负载供过滤，防止脏数据通过 base64 绕过 ---
-        payload_content = ""
-        
-        # 1. 拦截 VMess 中隐藏在 JSON 字段里的脏词
-        if link.startswith("vmess://"):
-            # [深度修复 1] 强制剥离尾随的畸形备注，保证提取深层 payload 时不会崩溃
-            b64_core = link[8:].split('#')[0]
-            decoded_json = safe_base64_decode(b64_core)
-            if decoded_json:
-                payload_content = decoded_json.lower()
-                
-        # 2. 拦截 Shadowsocks SIP002 规范中整体 Base64 编码的脏词
-        elif link.startswith("ss://"):
-            try:
-                body = link[5:].split('#')[0]
-                if '@' not in body:
-                    # SIP002 整体 base64 编码
-                    decoded_ss = safe_base64_decode(body)
-                    if decoded_ss:
-                        payload_content = decoded_ss.lower()
-                else:
-                    # 仅 user_info 进行了 base64 编码
-                    user_info = body.split('@')[0]
-                    decoded_user = safe_base64_decode(user_info)
-                    if decoded_user:
-                        payload_content = decoded_user.lower()
-            except Exception:
-                pass
-        
-        is_banned = False
-        # 遍历全小写的黑名单关键字
-        for keyword in lower_blacklist:
-            # 在全小写的名称、链接、以及解密后的 VMess/SS 负载中进行无死角包含匹配
-            if keyword in lower_node_name or keyword in lower_link or keyword in payload_content:
-                is_banned = True
-                break
-                
-        if not is_banned:
-            valid_nodes.append(link)
+    for link in lines:
+        name = get_name(link).lower()
+        full = unquote(link).lower()
+        payload = get_payload(link)
+
+        banned = any(kw in name or kw in full or kw in payload for kw in blacklist)
+        if banned:
+            filtered += 1
         else:
-            filtered_count += 1
-            # 开启调试时可打印被过滤的节点名称
-            # print(f"已过滤: {node_name or '未知名称'}")
+            kept.append(link)
 
-    # 保存明文节点结果 (输出使用标准的 utf-8 即可)
     try:
-        with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-            f.write("\n".join(valid_nodes))
-            
-        # 同时生成 Base64 订阅文件，保持与你的项目生态一致
-        b64_content = base64.b64encode("\n".join(valid_nodes).encode('utf-8')).decode('utf-8')
-        with open(SUB_FILE, 'w', encoding='utf-8') as f:
-            f.write(b64_content)
-            
-        print(f"过滤完成！")
-        print(f"命中关键字被剔除的节点数: {filtered_count}")
-        print(f"最终保留的有效节点数: {len(valid_nodes)}")
-        print(f"明文结果已保存至: {OUTPUT_FILE}")
-        print(f"订阅结果已保存至: {SUB_FILE}")
-        
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept))
+        b64 = base64.b64encode("\n".join(kept).encode()).decode()
+        with open(SUB_FILE, "w", encoding="utf-8") as f:
+            f.write(b64)
+        print(f"Filtered out: {filtered}")
+        print(f"Kept: {len(kept)}")
+        print(f"Saved {OUTPUT_FILE} / {SUB_FILE}")
     except Exception as e:
-        print(f"保存文件时发生错误: {e}")
+        print(f"Save failed: {e}")
+
 
 if __name__ == "__main__":
     main()
