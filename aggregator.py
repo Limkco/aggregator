@@ -40,7 +40,11 @@ TARGET_NODES: int = 8000
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
-LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\']+')
+# 更宽松的匹配，尽量保留完整 query
+LINK_PATTERN = re.compile(
+    r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\'`]+',
+    re.IGNORECASE
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,7 +85,7 @@ class NodeAggregator:
     def _setup_headers(self) -> None:
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Mozilla/5.0 (compatible; NodeAggregator/2.1)",
+            "User-Agent": "Mozilla/5.0 (compatible; NodeAggregator/2.2)",
         })
         if self.github_token:
             self.session.headers["Authorization"] = f"token {self.github_token}"
@@ -217,25 +221,40 @@ class NodeAggregator:
             proxies = data
         return [n for item in proxies if (n := self._parse_structured_node(item))]
 
+    def _clean_link(self, raw: str) -> str:
+        """智能清洗，尽量保护 Reality / xhttp 完整参数"""
+        m = raw.strip()
+        # 先去掉最外层常见包裹
+        while m and m[0] in ('"', "'", '<', '(', '['):
+            m = m[1:]
+        # 尾部清洗：只去掉真正多余的符号，遇到 Reality 关键参数立即停止
+        while m and m[-1] in ')]}>\"\',;':
+            # 保护 query 里的内容
+            if '?' in m and m.rfind('?') > m.rfind('://'):
+                # 已经进入 query 部分，只允许去掉最外层引号/括号
+                if m[-1] in '\"\'':
+                    m = m[:-1]
+                    continue
+                break
+            if m[-1] == '}' and m.count('{') >= m.count('}'):
+                break
+            if m[-1] == ']' and m.count('[') >= m.count(']'):
+                break
+            if m[-1] == ')' and m.count('(') >= m.count(')'):
+                break
+            m = m[:-1]
+        return m
+
     def extract_nodes(self, text: str) -> List[str]:
         if not text:
             return []
 
-        def clean(m: str) -> str:
-            while m and m[-1] in ")]}>\"',;":
-                if m[-1] == "}" and m.count("{") >= m.count("}"):
-                    break
-                if m[-1] == "]" and m.count("[") >= m.count("]"):
-                    break
-                if m[-1] == ")" and m.count("(") >= m.count(")"):
-                    break
-                m = m[:-1]
-            return m
-
         found: List[str] = []
         stripped = text.strip()
+
+        # 1. 结构化提取（Clash 等）
         parsed = None
-        if stripped.startswith(("{", "[")):
+        if stripped.startswith(('{', '[')):
             try:
                 parsed = json.loads(stripped)
             except json.JSONDecodeError:
@@ -248,17 +267,35 @@ class NodeAggregator:
         if parsed:
             found.extend(self._extract_from_structured(parsed))
 
-        clean_text = (text.replace("&amp;", "&").replace("\\u0026", "&")
-                      .replace("\\/", "/").replace('\\"', '"').replace("\\\\", "\\"))
-        found.extend(clean(m) for m in LINK_PATTERN.findall(clean_text))
+        # 2. 文本清洗后正则提取
+        clean_text = (text
+                      .replace('&amp;', '&')
+                      .replace('\\u0026', '&')
+                      .replace('\\/', '/')
+                      .replace('\\"', '"')
+                      .replace('\\\\', '\\'))
 
+        for match in LINK_PATTERN.findall(clean_text):
+            link = self._clean_link(match)
+            if len(link) > 20:
+                found.append(link)
+
+        # 3. Base64 解码后再提取
         decoded = self.safe_base64_decode(text)
         if decoded:
-            d_clean = (decoded.replace("&amp;", "&").replace("\\u0026", "&")
-                       .replace("\\/", "/").replace('\\"', '"').replace("\\\\", "\\"))
-            found.extend(clean(m) for m in LINK_PATTERN.findall(d_clean))
+            d_clean = (decoded
+                       .replace('&amp;', '&')
+                       .replace('\\u0026', '&')
+                       .replace('\\/', '/')
+                       .replace('\\"', '"')
+                       .replace('\\\\', '\\'))
+            for match in LINK_PATTERN.findall(d_clean):
+                link = self._clean_link(match)
+                if len(link) > 20:
+                    found.append(link)
 
-        return [n for n in found if len(n) > 15]
+        # 去重并过滤过短结果
+        return list({n for n in found if len(n) > 20 and "://" in n})
 
     def fetch_worker(self) -> None:
         while not self.should_stop:
@@ -282,7 +319,7 @@ class NodeAggregator:
                 with self.nodes_lock:
                     before = len(self.nodes)
                     for node in nodes:
-                        if len(node) < 15 or "://" not in node:
+                        if len(node) < 20 or "://" not in node:
                             continue
                         h = self._get_node_hash(node)
                         if h not in self.seen_hashes:
@@ -323,7 +360,7 @@ class NodeAggregator:
                            f"&per_page=30&page={page}&sort=indexed&order=desc")
 
                     success = False
-                    for attempt in range(2):          # 最多重试 1 次
+                    for attempt in range(2):
                         if self.should_stop or self.check_timeout():
                             return
                         try:
@@ -335,11 +372,9 @@ class NodeAggregator:
                                     logger.warning("Rate limit hit 3 times, stop search to avoid hanging")
                                     self.should_stop = True
                                     return
-
-                                wait = 20 + attempt * 5   # 最多等 25 秒
+                                wait = 20 + attempt * 5
                                 logger.warning(f"Rate limited, wait {wait}s then skip (try {attempt+1})")
                                 time.sleep(wait)
-                                # 不 continue 重试同一查询，直接跳到下一轮
                                 break
 
                             if resp.status_code == 200:
@@ -363,11 +398,10 @@ class NodeAggregator:
                             logger.error(f"Search error: {e}")
                             time.sleep(2)
 
-                    # 正常请求间隔
                     time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 0.6))
 
                     if success and not found_any:
-                        break   # 当前后缀无结果，跳过后续页
+                        break
 
         logger.info("Search finished")
 
