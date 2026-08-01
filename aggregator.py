@@ -32,11 +32,11 @@ KEYWORDS_GROUPS: List[List[str]] = [
 ]
 EXTENSIONS: List[str] = ["yaml", "yml", "txt"]
 MAX_PAGES: int = 2
-SEARCH_INTERVAL: float = 2.5
+SEARCH_INTERVAL: float = 2.8
 MAX_EXECUTION_TIME: int = 1500
 TIMEOUT: int = 8
 DOWNLOAD_WORKERS: int = 12
-TARGET_NODES: int = 8000          # early stop when reached
+TARGET_NODES: int = 8000
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
@@ -70,7 +70,7 @@ class NodeAggregator:
 
     def _init_session(self) -> requests.Session:
         session = requests.Session()
-        retry = Retry(total=3, backoff_factor=0.8, status_forcelist=[500, 502, 503, 504],
+        retry = Retry(total=2, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504],
                       allowed_methods=["GET"])
         adapter = HTTPAdapter(max_retries=retry, pool_connections=DOWNLOAD_WORKERS,
                               pool_maxsize=DOWNLOAD_WORKERS)
@@ -81,7 +81,7 @@ class NodeAggregator:
     def _setup_headers(self) -> None:
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Mozilla/5.0 (compatible; NodeAggregator/2.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; NodeAggregator/2.1)",
         })
         if self.github_token:
             self.session.headers["Authorization"] = f"token {self.github_token}"
@@ -300,35 +300,48 @@ class NodeAggregator:
     def search_producer(self) -> None:
         logger.info(f"Start search, {len(KEYWORDS_GROUPS)} groups")
         consecutive_limits = 0
+
         for group in KEYWORDS_GROUPS:
-            if self.should_stop:
+            if self.should_stop or self.check_timeout():
                 break
+
             kw_part = " OR ".join(f'"{k}"' if "://" in k else k for k in group)
+
             for ext in EXTENSIONS:
-                if self.should_stop:
+                if self.should_stop or self.check_timeout():
                     break
+
                 found_any = False
                 for page in range(1, MAX_PAGES + 1):
                     if self.should_stop or self.check_timeout():
                         self.should_stop = True
                         logger.warning("Timeout or target reached, stop search")
                         return
+
                     query = f"{kw_part} extension:{ext}"
                     api = (f"https://api.github.com/search/code?q={query}"
                            f"&per_page=30&page={page}&sort=indexed&order=desc")
+
                     success = False
-                    for attempt in range(3):
+                    for attempt in range(2):          # 最多重试 1 次
+                        if self.should_stop or self.check_timeout():
+                            return
                         try:
-                            resp = self.session.get(api, timeout=15)
+                            resp = self.session.get(api, timeout=12)
+
                             if resp.status_code in (403, 429):
                                 consecutive_limits += 1
-                                if consecutive_limits >= 4:
-                                    logger.warning("Rate limit too frequent, stop search")
+                                if consecutive_limits >= 3:
+                                    logger.warning("Rate limit hit 3 times, stop search to avoid hanging")
+                                    self.should_stop = True
                                     return
-                                wait = 45 * (attempt + 1)
-                                logger.warning(f"Rate limited, wait {wait}s (try {attempt+1})")
+
+                                wait = 20 + attempt * 5   # 最多等 25 秒
+                                logger.warning(f"Rate limited, wait {wait}s then skip (try {attempt+1})")
                                 time.sleep(wait)
-                                continue
+                                # 不 continue 重试同一查询，直接跳到下一轮
+                                break
+
                             if resp.status_code == 200:
                                 consecutive_limits = 0
                                 items = resp.json().get("items", [])
@@ -338,36 +351,43 @@ class NodeAggregator:
                                     for it in items:
                                         html = it.get("html_url")
                                         if html:
-                                            raw = html.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                                            raw = (html.replace("github.com", "raw.githubusercontent.com")
+                                                       .replace("/blob/", "/"))
                                             self.url_queue.put(raw)
                                 success = True
                                 break
+
                             logger.error(f"API {resp.status_code}")
                             break
                         except Exception as e:
                             logger.error(f"Search error: {e}")
-                            time.sleep(3)
-                    time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 0.8))
+                            time.sleep(2)
+
+                    # 正常请求间隔
+                    time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 0.6))
+
                     if success and not found_any:
-                        break
+                        break   # 当前后缀无结果，跳过后续页
+
         logger.info("Search finished")
 
     def run(self) -> None:
         logger.info(f"Start {DOWNLOAD_WORKERS} download workers")
-        workers = []
         for _ in range(DOWNLOAD_WORKERS):
             t = threading.Thread(target=self.fetch_worker, daemon=True)
             t.start()
-            workers.append(t)
+
         try:
             self.search_producer()
         except KeyboardInterrupt:
             logger.warning("Interrupted")
             self.should_stop = True
-        logger.info("Waiting remaining downloads (max 25s)...")
-        deadline = time.time() + 25
+
+        logger.info("Waiting remaining downloads (max 20s)...")
+        deadline = time.time() + 20
         while not self.url_queue.empty() and time.time() < deadline:
-            time.sleep(0.5)
+            time.sleep(0.4)
+
         self.should_stop = True
         self._save_results()
         try:
