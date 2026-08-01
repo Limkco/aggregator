@@ -60,7 +60,7 @@ jobs:
         if: steps.check_artifact.outputs.skip_crawl != 'true'
         uses: actions/setup-python@main
         with:
-          python-version: '3.11'
+          python-version: 'x'
 
       - name: Install dependencies
         if: steps.check_artifact.outputs.skip_crawl != 'true'
@@ -94,7 +94,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@main
         with:
-          python-version: '3.11'
+          python-version: 'x'
 
       - name: Download raw-nodes
         uses: actions/download-artifact@main
@@ -156,10 +156,7 @@ jobs:
 
       - name: Run active check
         run: python check_active.py
-
-      - name: Deep protocol check (max 10 min)
-        run: python deep_check.py
-
+      
       - name: Publish to release branch
         run: |
           mkdir -p publish_dir
