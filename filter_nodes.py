@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Filter nodes by blacklist keywords (name + deep payload)."""
+"""Filter nodes by blacklist keywords (name + deep payload).
+
+Stronger blacklist to remove ads, expired promo, workers pages, etc.
+"""
 
 import os
 import json
@@ -10,9 +13,19 @@ INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes_filtered.txt"
 SUB_FILE = "sub_filtered.txt"
 
+# 更强黑名单：广告 / 过期提示 / 常见无效来源
 BLACKLIST = [
-    "官网", "剩余", "到期", "流量", "过期", "套餐",
-    "hy", "pages", "Workers",
+    # 中文广告与过期提示
+    "官网", "剩余", "到期", "流量", "过期", "套餐", "续费", "充值",
+    "邀请", "返利", "优惠", "折扣", "限时", "活动", "群组", "频道",
+    "电报", "tg", "telegram", "客服", "购买", "订阅", "试用",
+    # 技术噪音 / 常见无效
+    "pages.dev", "workers.dev", "cloudflare", "cf-workers",
+    "hy2", "hysteria",  # 可选：若不想保留 hy2 可保留这两项；想保留则删掉
+    "localhost", "127.0.0.1", "0.0.0.0",
+    "example.com", "test.com",
+    # 常见垃圾备注
+    "免费", "白嫖", "稳定", "高速", "推荐", "最新",
 ]
 
 
@@ -65,7 +78,7 @@ def get_payload(link: str) -> str:
 
 
 def main() -> None:
-    print("--- Keyword filter ---")
+    print("--- Keyword filter (stronger) ---")
     if not os.path.exists(INPUT_FILE):
         print(f"Error: {INPUT_FILE} not found")
         return

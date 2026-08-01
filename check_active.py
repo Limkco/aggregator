@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Active node checker: TCP + SSL latency test, GeoIP annotation, ranking."""
+"""Active node checker: TCP + SSL latency test, GeoIP annotation, ranking.
+
+Changes vs original:
+- Strict latency cut (drop nodes slower than MAX_LATENCY_MS)
+- Lower MAX_NODES cap
+- Slightly lower concurrency for stability
+- UDP (Hysteria2) kept but ranked after TCP nodes
+"""
 
 import sys
 import os
@@ -27,18 +34,24 @@ except ImportError:
 INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes.txt"
 SUB_FILE = "sub.txt"
-MAX_NODES = 10000
-CONCURRENCY = 200
+
+# ---- stricter selection ----
+MAX_NODES = 600              # 最终最多保留数量
+MAX_LATENCY_MS = 800.0       # 超过此延迟直接丢弃（UDP 不受此限制）
+CONCURRENCY = 120            # 略降并发，更稳
 TCP_TIMEOUT = 2.0
 SSL_TIMEOUT = 3.0
 
-UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 REMARK_CLEAN_RE = re.compile(r"(?:-[A-Za-z]{2,3}(?:\d+ms|UDP))+$")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S"
+)
 logger = logging.getLogger("NodeChecker")
 
-# simple caches
 _dns_cache: Dict[str, Optional[str]] = {}
 _geo_cache: Dict[str, str] = {}
 
@@ -148,7 +161,6 @@ def clean_remark(name: str) -> str:
 
 
 def rebuild_link(link: str, cc: str, latency_str: str) -> str:
-    remark = f"{clean_remark('')}-{cc}{latency_str}"
     if link.startswith("vmess://"):
         try:
             b64 = link[8:].split("#")[0]
@@ -178,7 +190,8 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
         try:
             start = time.time()
             if is_udp:
-                latency = 0.0
+                # UDP 无法用 TCP/TLS 测延迟，给一个较大排序值，排在后面
+                latency = 9999.0
             else:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port), timeout=TCP_TIMEOUT
@@ -210,6 +223,10 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
                 except Exception:
                     pass
 
+            # 严格延迟截断（UDP 跳过）
+            if not is_udp and latency > MAX_LATENCY_MS:
+                return None
+
             cc = get_country(host)
             latency_str = "UDP" if is_udp else f"{latency:.0f}ms"
             new_link = rebuild_link(link, cc, latency_str)
@@ -227,7 +244,9 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
 
 
 async def main() -> None:
-    print("--- Fast node checker (TCP + SSL) ---")
+    print("--- Fast node checker (TCP + SSL + latency cut) ---")
+    print(f"MAX_LATENCY_MS={MAX_LATENCY_MS}  MAX_NODES={MAX_NODES}  CONCURRENCY={CONCURRENCY}")
+
     if not os.path.exists(INPUT_FILE):
         print(f"Error: {INPUT_FILE} not found")
         return
@@ -253,10 +272,13 @@ async def main() -> None:
         if done % 50 == 0 or done == total:
             elapsed = time.time() - start
             speed = done / elapsed if elapsed > 0 else 0
-            sys.stdout.write(f"\rProgress: {done}/{total} | Alive: {len(valid)} | {speed:.1f}/s")
+            sys.stdout.write(
+                f"\rProgress: {done}/{total} | Alive: {len(valid)} | {speed:.1f}/s"
+            )
             sys.stdout.flush()
 
     print()
+    # 按延迟升序；UDP 排在最后
     valid.sort(key=lambda x: x[1])
     final = [x[0] for x in valid[:MAX_NODES]]
 
@@ -267,9 +289,13 @@ async def main() -> None:
         with open(SUB_FILE, "w", encoding="utf-8") as f:
             f.write(b64)
         print(f"Done in {time.time() - start:.1f}s")
-        print(f"Alive: {len(valid)}, kept top {len(final)}")
+        print(f"Alive (after latency cut): {len(valid)}, kept top {len(final)}")
         if valid:
-            print(f"Best latency: {valid[0][1]:.1f}ms")
+            best = valid[0][1]
+            if best < 9000:
+                print(f"Best latency: {best:.1f}ms")
+            else:
+                print("Best nodes are UDP (no TCP latency)")
     except Exception as e:
         print(f"Save failed: {e}")
 
