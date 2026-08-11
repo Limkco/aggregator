@@ -23,7 +23,6 @@ try:
 except ImportError:
     yaml = None
 
-# ---------- Config ----------
 KEYWORDS_GROUPS: List[List[str]] = [
     ["vmess://", "vless://", "trojan://"],
     ["ss://", "shadowsocks", "hysteria2", "hy://"],
@@ -67,9 +66,9 @@ class NodeAggregator:
         self.url_queue: queue.Queue = queue.Queue()
         self.sleep_interval = SEARCH_INTERVAL if token else 12.0
         if not token:
-            logger.warning("No GH_TOKEN, using slow mode (12s/req)")
+            logger.warning("未检测到 GH_TOKEN，开启低速模式 (12s/请求)")
         if not yaml:
-            logger.warning("PyYAML missing, YAML parsing disabled")
+            logger.warning("未安装 PyYAML，YAML 解析功能已禁用")
 
     def _init_session(self) -> requests.Session:
         session = requests.Session()
@@ -88,7 +87,7 @@ class NodeAggregator:
         })
         if self.github_token:
             self.session.headers["Authorization"] = f"token {self.github_token}"
-            logger.info("GitHub Token loaded")
+            logger.info("已加载 GitHub Token")
 
     def check_timeout(self) -> bool:
         return time.time() - self.start_time > MAX_EXECUTION_TIME
@@ -146,12 +145,18 @@ class NodeAggregator:
 
     def _build_vmess_link(self, config: Dict[str, Any]) -> Optional[str]:
         try:
+            server = config.get("server")
+            port = config.get("port")
+            uuid_val = config.get("uuid")
+            if not server or not port or not uuid_val:
+                return None
+
             v = {
                 "v": "2",
                 "ps": str(config.get("name", "unnamed")),
-                "add": str(config.get("server")),
-                "port": str(config.get("port")),
-                "id": str(config.get("uuid")),
+                "add": str(server),
+                "port": str(port),
+                "id": str(uuid_val),
                 "aid": str(config.get("alterId", 0)),
                 "scy": str(config.get("cipher", "auto")),
                 "net": str(config.get("network", "tcp")),
@@ -160,11 +165,8 @@ class NodeAggregator:
                 "path": str(config.get("ws-path") or config.get("ws-opts", {}).get("path", "")),
                 "tls": "tls" if config.get("tls") else "",
             }
-            if not v["add"] or not v["id"]:
-                return None
-            return "vmess://" + base64.b64encode(
-                json.dumps(v, separators=(",", ":")).encode()
-            ).decode()
+            json_str = json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+            return "vmess://" + base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
         except Exception:
             return None
 
@@ -176,7 +178,7 @@ class NodeAggregator:
             )
             if not all([server, port, password, method]):
                 return None
-            user = base64.b64encode(f"{method}:{password}".encode()).decode().strip()
+            user = base64.b64encode(f"{method}:{password}".encode("utf-8")).decode("utf-8").strip()
             return f"ss://{user}@{server}:{port}#{quote(str(config.get('name', 'ss')))}"
         except Exception:
             return None
@@ -308,7 +310,7 @@ class NodeAggregator:
                             self.seen_hashes.add(h)
                             self.nodes.add(node)
                     if len(self.nodes) > before and len(self.nodes) % 100 == 0:
-                        logger.info(f"Unique nodes: {len(self.nodes)}")
+                        logger.info(f"去重节点数: {len(self.nodes)}")
                     if len(self.nodes) >= TARGET_NODES:
                         self.should_stop = True
             except Exception:
@@ -317,7 +319,7 @@ class NodeAggregator:
                 self.url_queue.task_done()
 
     def search_producer(self) -> None:
-        logger.info(f"Start search, {len(KEYWORDS_GROUPS)} groups")
+        logger.info(f"开始搜索，共 {len(KEYWORDS_GROUPS)} 组关键词")
         consecutive_limits = 0
 
         for group in KEYWORDS_GROUPS:
@@ -334,7 +336,7 @@ class NodeAggregator:
                 for page in range(1, MAX_PAGES + 1):
                     if self.should_stop or self.check_timeout():
                         self.should_stop = True
-                        logger.warning("Timeout or target reached, stop search")
+                        logger.warning("达到超时上限或目标节点数，停止搜索")
                         return
 
                     query = f"{kw_part} extension:{ext}"
@@ -351,18 +353,18 @@ class NodeAggregator:
                             if resp.status_code in (403, 429):
                                 consecutive_limits += 1
                                 if consecutive_limits >= 3:
-                                    logger.warning("Rate limit hit 3 times, stop search to avoid hanging")
+                                    logger.warning("连续 3 次触发速率限制，停止搜索")
                                     self.should_stop = True
                                     return
                                 wait = 20 + attempt * 5
-                                logger.warning(f"Rate limited, wait {wait}s then skip (try {attempt+1})")
+                                logger.warning(f"触发速率限制，等待 {wait} 秒后重试")
                                 time.sleep(wait)
                                 break
 
                             if resp.status_code == 200:
                                 consecutive_limits = 0
                                 items = resp.json().get("items", [])
-                                logger.info(f"[{query[:60]}...] P{page} -> {len(items)} files")
+                                logger.info(f"[{query[:60]}...] 页码 {page} -> 发现 {len(items)} 个文件")
                                 if items:
                                     found_any = True
                                     for it in items:
@@ -374,10 +376,10 @@ class NodeAggregator:
                                 success = True
                                 break
 
-                            logger.error(f"API {resp.status_code}")
+                            logger.error(f"API 响应状态码错误: {resp.status_code}")
                             break
                         except Exception as e:
-                            logger.error(f"Search error: {e}")
+                            logger.error(f"搜索发生异常: {e}")
                             time.sleep(2)
 
                     time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 0.6))
@@ -385,10 +387,10 @@ class NodeAggregator:
                     if success and not found_any:
                         break
 
-        logger.info("Search finished")
+        logger.info("搜索流程执行结束")
 
     def run(self) -> None:
-        logger.info(f"Start {DOWNLOAD_WORKERS} download workers")
+        logger.info(f"启动 {DOWNLOAD_WORKERS} 个下载线程")
         for _ in range(DOWNLOAD_WORKERS):
             t = threading.Thread(target=self.fetch_worker, daemon=True)
             t.start()
@@ -396,10 +398,10 @@ class NodeAggregator:
         try:
             self.search_producer()
         except KeyboardInterrupt:
-            logger.warning("Interrupted")
+            logger.warning("收到手动终止指令")
             self.should_stop = True
 
-        logger.info("Waiting remaining downloads (max 20s)...")
+        logger.info("等待剩余下载任务完成 (上限 20 秒)...")
         deadline = time.time() + 20
         while not self.url_queue.empty() and time.time() < deadline:
             time.sleep(0.4)
@@ -412,23 +414,23 @@ class NodeAggregator:
             pass
 
     def _save_results(self) -> None:
-        logger.info(f"=== Final unique nodes: {len(self.nodes)} ===")
+        logger.info(f"=== 最终有效去重节点总数: {len(self.nodes)} ===")
         plain = "\n".join(self.nodes) if self.nodes else ""
         try:
             with open(RAW_OUTPUT_FILE, "w", encoding="utf-8") as f:
                 f.write(plain)
         except Exception as e:
-            logger.error(f"Save plain failed: {e}")
+            logger.error(f"保存明文文件失败: {e}")
         if not self.nodes:
-            logger.warning("Empty result")
+            logger.warning("节点列表为空")
             return
         try:
-            b64 = base64.b64encode(plain.encode()).decode()
+            b64 = base64.b64encode(plain.encode("utf-8")).decode("utf-8")
             with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                 f.write(b64)
-            logger.info(f"Saved {OUTPUT_FILE} and {RAW_OUTPUT_FILE}")
+            logger.info(f"已成功写入 {OUTPUT_FILE} 与 {RAW_OUTPUT_FILE}")
         except Exception as e:
-            logger.error(f"Save base64 failed: {e}")
+            logger.error(f"保存 Base64 订阅文件失败: {e}")
 
 
 if __name__ == "__main__":
