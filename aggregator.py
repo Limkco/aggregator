@@ -40,7 +40,6 @@ TARGET_NODES: int = 8000
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
-# 更宽松的匹配，尽量保留完整 query
 LINK_PATTERN = re.compile(
     r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\'`]+',
     re.IGNORECASE
@@ -114,13 +113,16 @@ class NodeAggregator:
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
+            core = rest.split("#")[0]
             sni = None
+
             if protocol == "vmess":
-                b64 = rest.split("#")[0]
-                decoded = self.safe_base64_decode(b64)
+                decoded = self.safe_base64_decode(core)
                 if decoded:
                     conf = json.loads(decoded)
                     sni = conf.get("sni") or conf.get("host") or conf.get("add")
+                    conf.pop("ps", None)
+                    core = json.dumps(conf, sort_keys=True)
             else:
                 parsed = urlparse(link)
                 qs = parse_qs(parsed.query)
@@ -134,22 +136,11 @@ class NodeAggregator:
                         sni = part.rsplit(":", 1)[0].strip("[]")
                     else:
                         sni = part.rsplit(":", 1)[0]
+
+            feature_str = f"{protocol}://{core}"
             if sni:
-                return hashlib.md5(f"sni_{sni}".encode()).hexdigest()
-        except Exception:
-            pass
-        try:
-            protocol, rest = link.split("://", 1)
-            protocol = protocol.lower()
-            if protocol == "vmess":
-                b64 = rest.split("#")[0]
-                decoded = self.safe_base64_decode(b64)
-                if decoded:
-                    conf = json.loads(decoded)
-                    conf.pop("ps", None)
-                    return hashlib.md5(f"vmess://{json.dumps(conf, sort_keys=True)}".encode()).hexdigest()
-            core = rest.split("#")[0]
-            return hashlib.md5(f"{protocol}://{core}".encode()).hexdigest()
+                feature_str += f"?sni={sni}"
+            return hashlib.md5(feature_str.encode()).hexdigest()
         except Exception:
             return hashlib.md5(link.encode()).hexdigest()
 
@@ -222,16 +213,11 @@ class NodeAggregator:
         return [n for item in proxies if (n := self._parse_structured_node(item))]
 
     def _clean_link(self, raw: str) -> str:
-        """智能清洗，尽量保护 Reality / xhttp 完整参数"""
         m = raw.strip()
-        # 先去掉最外层常见包裹
         while m and m[0] in ('"', "'", '<', '(', '['):
             m = m[1:]
-        # 尾部清洗：只去掉真正多余的符号，遇到 Reality 关键参数立即停止
         while m and m[-1] in ')]}>\"\',;':
-            # 保护 query 里的内容
             if '?' in m and m.rfind('?') > m.rfind('://'):
-                # 已经进入 query 部分，只允许去掉最外层引号/括号
                 if m[-1] in '\"\'':
                     m = m[:-1]
                     continue
@@ -252,7 +238,6 @@ class NodeAggregator:
         found: List[str] = []
         stripped = text.strip()
 
-        # 1. 结构化提取（Clash 等）
         parsed = None
         if stripped.startswith(('{', '[')):
             try:
@@ -267,7 +252,6 @@ class NodeAggregator:
         if parsed:
             found.extend(self._extract_from_structured(parsed))
 
-        # 2. 文本清洗后正则提取
         clean_text = (text
                       .replace('&amp;', '&')
                       .replace('\\u0026', '&')
@@ -280,7 +264,6 @@ class NodeAggregator:
             if len(link) > 20:
                 found.append(link)
 
-        # 3. Base64 解码后再提取
         decoded = self.safe_base64_decode(text)
         if decoded:
             d_clean = (decoded
@@ -294,7 +277,6 @@ class NodeAggregator:
                 if len(link) > 20:
                     found.append(link)
 
-        # 去重并过滤过短结果
         return list({n for n in found if len(n) > 20 and "://" in n})
 
     def fetch_worker(self) -> None:
