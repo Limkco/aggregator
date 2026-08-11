@@ -34,14 +34,16 @@ def get_node_hash(link: str) -> str:
     try:
         protocol, rest = link.split("://", 1)
         protocol = protocol.lower()
+        core = rest.split("#")[0]
         sni = None
 
         if protocol == "vmess":
-            b64 = rest.split("#")[0]
-            decoded = safe_b64decode(b64)
+            decoded = safe_b64decode(core)
             if decoded:
                 conf = json.loads(decoded)
                 sni = conf.get("sni") or conf.get("host") or conf.get("add")
+                conf.pop("ps", None)
+                core = json.dumps(conf, sort_keys=True)
         else:
             parsed = urlparse(link)
             qs = parse_qs(parsed.query)
@@ -56,25 +58,11 @@ def get_node_hash(link: str) -> str:
                 else:
                     sni = part.rsplit(":", 1)[0]
 
+        # 特征哈希：综合考虑协议、核心网络配置与 SNI，避免单一 SNI 误杀同 CDN 的不同节点
+        feature_str = f"{protocol}://{core}"
         if sni:
-            return hashlib.md5(f"sni_{sni}".encode()).hexdigest()
-    except Exception:
-        pass
-
-    try:
-        protocol, rest = link.split("://", 1)
-        protocol = protocol.lower()
-        if protocol == "vmess":
-            b64 = rest.split("#")[0]
-            decoded = safe_b64decode(b64)
-            if decoded:
-                conf = json.loads(decoded)
-                conf.pop("ps", None)
-                return hashlib.md5(
-                    f"vmess://{json.dumps(conf, sort_keys=True)}".encode()
-                ).hexdigest()
-        core = rest.split("#")[0]
-        return hashlib.md5(f"{protocol}://{core}".encode()).hexdigest()
+            feature_str += f"?sni={sni}"
+        return hashlib.md5(feature_str.encode()).hexdigest()
     except Exception:
         return hashlib.md5(link.encode()).hexdigest()
 
