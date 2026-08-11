@@ -13,7 +13,7 @@ INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes_filtered.txt"
 SUB_FILE = "sub_filtered.txt"
 
-# 更强黑名单：广告 / 过期提示 / 常见无效来源
+# 更强黑名单：广告 / 过期提示 / 常见无效来源 (已剔除协议关键字 hy2/hysteria 避免误杀正常节点)
 BLACKLIST = [
     # 中文广告与过期提示
     "官网", "剩余", "到期", "流量", "过期", "套餐", "续费", "充值",
@@ -21,7 +21,6 @@ BLACKLIST = [
     "电报", "tg", "telegram", "客服", "购买", "订阅", "试用",
     # 技术噪音 / 常见无效
     "pages.dev", "workers.dev", "cloudflare", "cf-workers",
-    "hy2", "hysteria",  # 可选：若不想保留 hy2 可保留这两项；想保留则删掉
     "localhost", "127.0.0.1", "0.0.0.0",
     "example.com", "test.com",
     # 常见垃圾备注
