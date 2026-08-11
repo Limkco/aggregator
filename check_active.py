@@ -15,7 +15,7 @@ import ipaddress
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from typing import Optional, Tuple, Dict
 
-assert sys.version_info >= (3, 11), "Requires Python 3.11+"
+assert sys.version_info >= (3, 11), "需要 Python 3.11 及以上版本"
 
 try:
     import maxminddb
@@ -84,7 +84,7 @@ def get_country(host: str) -> str:
 
 
 def parse_node(link: str) -> Optional[Tuple[str, int, Optional[str], bool, bool]]:
-    """Return (host, port, sni, is_tls, is_udp) or None."""
+    """返回 (host, port, sni, is_tls, is_udp) 或 None"""
     link = link.strip()
     host = port = sni = None
     is_tls = is_udp = False
@@ -92,7 +92,10 @@ def parse_node(link: str) -> Optional[Tuple[str, int, Optional[str], bool, bool]
     try:
         if link.startswith("vmess://"):
             b64 = link[8:].split("#")[0]
-            conf = json.loads(safe_b64decode(b64) or "{}")
+            conf_str = safe_b64decode(b64)
+            if not conf_str:
+                return None
+            conf = json.loads(conf_str)
             if not UUID_RE.match(str(conf.get("id", ""))):
                 return None
             host = conf.get("add")
@@ -156,11 +159,12 @@ def rebuild_link(link: str, cc: str, latency_str: str) -> str:
     if link.startswith("vmess://"):
         try:
             b64 = link[8:].split("#")[0]
-            conf = json.loads(safe_b64decode(b64) or "{}")
-            conf["ps"] = f"{clean_remark(conf.get('ps', ''))}-{cc}{latency_str}"
-            return "vmess://" + base64.b64encode(
-                json.dumps(conf, separators=(",", ":")).encode()
-            ).decode()
+            conf_str = safe_b64decode(b64)
+            if conf_str:
+                conf = json.loads(conf_str)
+                conf["ps"] = f"{clean_remark(conf.get('ps', ''))}-{cc}{latency_str}"
+                json_bytes = json.dumps(conf, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                return "vmess://" + base64.b64encode(json_bytes).decode("utf-8")
         except Exception:
             pass
     parts = link.split("#", 1)
@@ -234,21 +238,21 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
 
 
 async def main() -> None:
-    print("--- Fast node checker (TCP + SSL + latency cut) ---")
-    print(f"MAX_LATENCY_MS={MAX_LATENCY_MS}  MAX_NODES={MAX_NODES}  CONCURRENCY={CONCURRENCY}")
+    print("--- 节点快速检测 (TCP + SSL + 延迟筛选) ---")
+    print(f"最大延迟上限={MAX_LATENCY_MS}ms  保留节点数={MAX_NODES}  并发数={CONCURRENCY}")
 
     if not os.path.exists(INPUT_FILE):
-        print(f"Error: {INPUT_FILE} not found")
+        print(f"错误: 未找到输入文件 {INPUT_FILE}")
         return
 
     with open(INPUT_FILE, "r", encoding="utf-8-sig") as f:
         nodes = list({line.strip() for line in f if line.strip()})
-    print(f"Initial unique nodes: {len(nodes)}")
+    print(f"待检测唯一节点数: {len(nodes)}")
 
     sem = asyncio.Semaphore(CONCURRENCY)
     tasks = [check_one(n, sem) for n in nodes]
 
-    print(f"Checking (TCP {TCP_TIMEOUT}s / SSL {SSL_TIMEOUT}s)...")
+    print(f"开始检测 (TCP 超时 {TCP_TIMEOUT}s / SSL 超时 {SSL_TIMEOUT}s)...")
     start = time.time()
     valid = []
     done = 0
@@ -263,7 +267,7 @@ async def main() -> None:
             elapsed = time.time() - start
             speed = done / elapsed if elapsed > 0 else 0
             sys.stdout.write(
-                f"\rProgress: {done}/{total} | Alive: {len(valid)} | {speed:.1f}/s"
+                f"\r进度: {done}/{total} | 存活: {len(valid)} | 速度: {speed:.1f}个/s"
             )
             sys.stdout.flush()
 
@@ -272,25 +276,26 @@ async def main() -> None:
     final = [x[0] for x in valid[:MAX_NODES]]
 
     try:
+        plain_data = "\n".join(final)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(final))
-        b64 = base64.b64encode("\n".join(final).encode()).decode()
+            f.write(plain_data)
+        b64_data = base64.b64encode(plain_data.encode("utf-8")).decode("utf-8")
         with open(SUB_FILE, "w", encoding="utf-8") as f:
-            f.write(b64)
-        print(f"Done in {time.time() - start:.1f}s")
-        print(f"Alive (after latency cut): {len(valid)}, kept top {len(final)}")
+            f.write(b64_data)
+        print(f"检测完成，耗时 {time.time() - start:.1f} 秒")
+        print(f"实际存活节点: {len(valid)} 个，保留 Top {len(final)}")
         if valid:
             best = valid[0][1]
             if best < 9000:
-                print(f"Best latency: {best:.1f}ms")
+                print(f"最优延迟: {best:.1f}ms")
             else:
-                print("Best nodes are UDP (no TCP latency)")
+                print("最优节点为 UDP 节点 (无 TCP 延迟记录)")
     except Exception as e:
-        print(f"Save failed: {e}")
+        print(f"保存文件过程发生异常: {e}")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopped by user")
+        print("\n用户手动停止测试")
