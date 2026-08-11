@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Active node checker: TCP + SSL latency test, GeoIP annotation, ranking.
-
-Changes vs original:
-- Strict latency cut (drop nodes slower than MAX_LATENCY_MS)
-- Lower MAX_NODES cap
-- Slightly lower concurrency for stability
-- UDP (Hysteria2) kept but ranked after TCP nodes
-"""
+"""Active node checker: TCP + SSL latency test, GeoIP annotation, ranking."""
 
 import sys
 import os
@@ -35,12 +28,11 @@ INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes.txt"
 SUB_FILE = "sub.txt"
 
-# ---- stricter selection ----
-MAX_NODES = 600              # 最终最多保留数量
-MAX_LATENCY_MS = 800.0       # 超过此延迟直接丢弃（UDP 不受此限制）
-CONCURRENCY = 120            # 略降并发，更稳
-TCP_TIMEOUT = 2.0
-SSL_TIMEOUT = 3.0
+MAX_NODES = 600
+MAX_LATENCY_MS = 1500.0
+CONCURRENCY = 120
+TCP_TIMEOUT = 3.5
+SSL_TIMEOUT = 3.5
 
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -182,40 +174,39 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
     if not parsed:
         return None
     host, port, sni, is_tls, is_udp = parsed
-    if not is_tls and not is_udp:
-        return None
 
     async with sem:
         writer = None
         try:
             start = time.time()
             if is_udp:
-                # UDP 无法用 TCP/TLS 测延迟，给一个较大排序值，排在后面
                 latency = 9999.0
             else:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port), timeout=TCP_TIMEOUT
                 )
                 tcp_ms = (time.time() - start) * 1000
+                latency = tcp_ms
 
-                tls_sni = sni
-                if sni:
-                    try:
-                        ipaddress.ip_address(sni)
-                        tls_sni = None
-                    except ValueError:
-                        pass
+                if is_tls:
+                    tls_sni = sni
+                    if sni:
+                        try:
+                            ipaddress.ip_address(sni)
+                            tls_sni = None
+                        except ValueError:
+                            pass
 
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
 
-                ssl_start = time.time()
-                await asyncio.wait_for(
-                    writer.start_tls(ctx, server_hostname=tls_sni),
-                    timeout=SSL_TIMEOUT,
-                )
-                latency = tcp_ms + (time.time() - ssl_start) * 1000
+                    ssl_start = time.time()
+                    await asyncio.wait_for(
+                        writer.start_tls(ctx, server_hostname=tls_sni),
+                        timeout=SSL_TIMEOUT,
+                    )
+                    latency = tcp_ms + (time.time() - ssl_start) * 1000
 
                 writer.close()
                 try:
@@ -223,7 +214,6 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
                 except Exception:
                     pass
 
-            # 严格延迟截断（UDP 跳过）
             if not is_udp and latency > MAX_LATENCY_MS:
                 return None
 
@@ -278,7 +268,6 @@ async def main() -> None:
             sys.stdout.flush()
 
     print()
-    # 按延迟升序；UDP 排在最后
     valid.sort(key=lambda x: x[1])
     final = [x[0] for x in valid[:MAX_NODES]]
 
