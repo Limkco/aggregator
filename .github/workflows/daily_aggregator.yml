@@ -3,7 +3,7 @@ name: Aggregator Daily Build
 on:
   schedule:
     # 每 10 天 UTC 0:00 运行（北京时间 8:00）
-    - cron: '0 0 */10 * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       force_crawl:
