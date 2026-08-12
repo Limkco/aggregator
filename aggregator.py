@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Node aggregator: search GitHub for proxy configs, extract & deduplicate nodes."""
+"""节点聚合器: 搜索 GitHub 上的代理配置，提取并去重节点。"""
 
 import os
 import re
@@ -11,7 +11,7 @@ import logging
 import threading
 import queue
 import hashlib
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote, urlparse, parse_qs, unquote
 from typing import List, Set, Dict, Any, Optional, Union
 
 import requests
@@ -23,6 +23,7 @@ try:
 except ImportError:
     yaml = None
 
+# ==================== 全局配置 ====================
 KEYWORDS_GROUPS: List[List[str]] = [
     ["vmess://", "vless://", "trojan://"],
     ["ss://", "shadowsocks", "hysteria2", "hy://"],
@@ -39,11 +40,13 @@ TARGET_NODES: int = 8000
 OUTPUT_FILE: str = "sub.txt"
 RAW_OUTPUT_FILE: str = "nodes.txt"
 
+# 匹配常见代理协议链接的正则表达式
 LINK_PATTERN = re.compile(
     r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\'`]+',
     re.IGNORECASE
 )
 
+# 日志格式配置
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -53,34 +56,46 @@ logger = logging.getLogger(__name__)
 
 
 class NodeAggregator:
+    """节点收集与去重核心类"""
+
     def __init__(self, token: Optional[str]):
         self.github_token = token
-        self.nodes: Set[str] = set()
-        self.seen_hashes: Set[str] = set()
-        self.content_hashes: Set[str] = set()
-        self.nodes_lock = threading.Lock()
+        self.nodes: Set[str] = set()               # 最终有效节点集合
+        self.seen_hashes: Set[str] = set()          # 节点特征 Hash 集合（用于去重）
+        self.content_hashes: Set[str] = set()       # 文件内容 Hash 集合（避免重复解析相同文件）
+        self.nodes_lock = threading.Lock()         # 线程安全锁
         self.session = self._init_session()
         self._setup_headers()
         self.start_time = time.time()
         self.should_stop = False
-        self.url_queue: queue.Queue = queue.Queue()
+        self.url_queue: queue.Queue = queue.Queue() # 待下载 URL 队列
         self.sleep_interval = SEARCH_INTERVAL if token else 12.0
+        
         if not token:
             logger.warning("未检测到 GH_TOKEN，开启低速模式 (12s/请求)")
         if not yaml:
             logger.warning("未安装 PyYAML，YAML 解析功能已禁用")
 
     def _init_session(self) -> requests.Session:
+        """初始化带有自动重试与连接池的 Requests Session"""
         session = requests.Session()
-        retry = Retry(total=2, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504],
-                      allowed_methods=["GET"])
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=DOWNLOAD_WORKERS,
-                              pool_maxsize=DOWNLOAD_WORKERS)
+        retry = Retry(
+            total=2, 
+            backoff_factor=0.6, 
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry, 
+            pool_connections=DOWNLOAD_WORKERS,
+            pool_maxsize=DOWNLOAD_WORKERS
+        )
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
 
     def _setup_headers(self) -> None:
+        """设置 GitHub API 请求头"""
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "Mozilla/5.0 (compatible; NodeAggregator/2.2)",
@@ -90,13 +105,17 @@ class NodeAggregator:
             logger.info("已加载 GitHub Token")
 
     def check_timeout(self) -> bool:
+        """检查程序执行时间是否超出安全阈值"""
         return time.time() - self.start_time > MAX_EXECUTION_TIME
 
     def safe_base64_decode(self, text: str) -> Optional[str]:
+        """安全解码 Base64 字符串，包含自动补全与 URL 安全字符替换"""
         if not text:
             return None
         text = text.strip().replace(" ", "").replace("\n", "").replace("\r", "")
+        text = unquote(text)  # 容错处理 URL 编码字符
         text = text.replace("-", "+").replace("_", "/")
+        
         pad = len(text) % 4
         if pad:
             text += "=" * (4 - pad)
@@ -106,13 +125,17 @@ class NodeAggregator:
             return None
 
     def _get_node_hash(self, link: str) -> str:
+        """
+        根据节点链接提取核心特征（协议、核心配置/地址、SNI/Host）并计算 MD5，
+        忽略备注名（ps/remark）等无用变动，实现精准语义去重。
+        """
         link = link.strip()
         if "://" not in link:
             return hashlib.md5(link.encode()).hexdigest()
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
-            core = rest.split("#")[0]
+            core = rest.split("#")[0]  # 移除备注
             sni = None
 
             if protocol == "vmess":
@@ -120,7 +143,7 @@ class NodeAggregator:
                 if decoded:
                     conf = json.loads(decoded)
                     sni = conf.get("sni") or conf.get("host") or conf.get("add")
-                    conf.pop("ps", None)
+                    conf.pop("ps", None)  # 移除节点别名以进行纯净去重
                     core = json.dumps(conf, sort_keys=True)
             else:
                 parsed = urlparse(link)
@@ -144,6 +167,7 @@ class NodeAggregator:
             return hashlib.md5(link.encode()).hexdigest()
 
     def _build_vmess_link(self, config: Dict[str, Any]) -> Optional[str]:
+        """将结构化字典构建为 VMess 节点链接"""
         try:
             server = config.get("server")
             port = config.get("port")
@@ -171,6 +195,7 @@ class NodeAggregator:
             return None
 
     def _build_ss_link(self, config: Dict[str, Any]) -> Optional[str]:
+        """将结构化字典构建为 Shadowsocks 节点链接"""
         try:
             server, port, password, method = (
                 config.get("server"), config.get("port"),
@@ -184,6 +209,7 @@ class NodeAggregator:
             return None
 
     def _build_trojan_link(self, config: Dict[str, Any]) -> Optional[str]:
+        """将结构化字典构建为 Trojan 节点链接"""
         try:
             server, port, password = config.get("server"), config.get("port"), config.get("password")
             if not all([server, port, password]):
@@ -195,6 +221,7 @@ class NodeAggregator:
             return None
 
     def _parse_structured_node(self, item: Dict[str, Any]) -> Optional[str]:
+        """解析单条结构化节点数据"""
         if not isinstance(item, dict):
             return None
         proto = str(item.get("type", "")).lower()
@@ -207,6 +234,7 @@ class NodeAggregator:
         return None
 
     def _extract_from_structured(self, data: Union[Dict, List]) -> List[str]:
+        """从 JSON/YAML 结构化对象中提取节点"""
         proxies = []
         if isinstance(data, dict) and isinstance(data.get("proxies"), list):
             proxies = data["proxies"]
@@ -215,6 +243,7 @@ class NodeAggregator:
         return [n for item in proxies if (n := self._parse_structured_node(item))]
 
     def _clean_link(self, raw: str) -> str:
+        """清除提取出的链接末尾或首部的闭合符号与废字符"""
         m = raw.strip()
         while m and m[0] in ('"', "'", '<', '(', '['):
             m = m[1:]
@@ -234,12 +263,14 @@ class NodeAggregator:
         return m
 
     def extract_nodes(self, text: str) -> List[str]:
+        """从文本中综合提取节点（支持 JSON/YAML/明文/Base64）"""
         if not text:
             return []
 
         found: List[str] = []
         stripped = text.strip()
 
+        # 尝试结构化解析 (JSON / YAML)
         parsed = None
         if stripped.startswith(('{', '[')):
             try:
@@ -254,6 +285,7 @@ class NodeAggregator:
         if parsed:
             found.extend(self._extract_from_structured(parsed))
 
+        # 文本清理（还原转义字符）
         clean_text = (text
                       .replace('&amp;', '&')
                       .replace('\\u0026', '&')
@@ -261,11 +293,13 @@ class NodeAggregator:
                       .replace('\\"', '"')
                       .replace('\\\\', '\\'))
 
+        # 正则直接提取
         for match in LINK_PATTERN.findall(clean_text):
             link = self._clean_link(match)
             if len(link) > 20:
                 found.append(link)
 
+        # Base64 解密后再尝试提取
         decoded = self.safe_base64_decode(text)
         if decoded:
             d_clean = (decoded
@@ -282,24 +316,30 @@ class NodeAggregator:
         return list({n for n in found if len(n) > 20 and "://" in n})
 
     def fetch_worker(self) -> None:
+        """消费者工作线程：从队列拉取 URL 并进行抓取、提取和去重"""
         while not self.should_stop:
             try:
                 url = self.url_queue.get(timeout=1)
             except queue.Empty:
                 continue
+
+            # 只有获取任务成功后，才在 try...finally 确保 task_done 被执行
             try:
                 resp = self.session.get(url, timeout=TIMEOUT)
                 if resp.status_code != 200:
                     continue
                 content = resp.content
                 c_hash = hashlib.md5(content).hexdigest()
+                
                 with self.nodes_lock:
                     if c_hash in self.content_hashes:
                         continue
                     self.content_hashes.add(c_hash)
+
                 nodes = self.extract_nodes(content.decode("utf-8", errors="ignore"))
                 if not nodes:
                     continue
+
                 with self.nodes_lock:
                     before = len(self.nodes)
                     for node in nodes:
@@ -309,6 +349,7 @@ class NodeAggregator:
                         if h not in self.seen_hashes:
                             self.seen_hashes.add(h)
                             self.nodes.add(node)
+
                     if len(self.nodes) > before and len(self.nodes) % 100 == 0:
                         logger.info(f"去重节点数: {len(self.nodes)}")
                     if len(self.nodes) >= TARGET_NODES:
@@ -319,6 +360,7 @@ class NodeAggregator:
                 self.url_queue.task_done()
 
     def search_producer(self) -> None:
+        """生产者线程：调用 GitHub Search API，生成 Raw 文件下载 URL 并入队"""
         logger.info(f"开始搜索，共 {len(KEYWORDS_GROUPS)} 组关键词")
         consecutive_limits = 0
 
@@ -390,6 +432,7 @@ class NodeAggregator:
         logger.info("搜索流程执行结束")
 
     def run(self) -> None:
+        """程序入口方法：启动下载工作线程，执行搜索，等待结束并保存结果"""
         logger.info(f"启动 {DOWNLOAD_WORKERS} 个下载线程")
         for _ in range(DOWNLOAD_WORKERS):
             t = threading.Thread(target=self.fetch_worker, daemon=True)
@@ -414,6 +457,7 @@ class NodeAggregator:
             pass
 
     def _save_results(self) -> None:
+        """保存明文及 Base64 加密的节点列表到文件"""
         logger.info(f"=== 最终有效去重节点总数: {len(self.nodes)} ===")
         plain = "\n".join(self.nodes) if self.nodes else ""
         try:
@@ -421,9 +465,11 @@ class NodeAggregator:
                 f.write(plain)
         except Exception as e:
             logger.error(f"保存明文文件失败: {e}")
+            
         if not self.nodes:
             logger.warning("节点列表为空")
             return
+            
         try:
             b64 = base64.b64encode(plain.encode("utf-8")).decode("utf-8")
             with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
