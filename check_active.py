@@ -28,7 +28,7 @@ INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes.txt"
 SUB_FILE = "sub.txt"
 
-MAX_NODES = 600
+MAX_EXECUTION_TIME = 300.0  # 最大运行时间限制 (秒)
 MAX_LATENCY_MS = 1500.0
 CONCURRENCY = 120
 TCP_TIMEOUT = 3.5
@@ -239,7 +239,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
 
 async def main() -> None:
     print("--- 节点快速检测 (TCP + SSL + 延迟筛选) ---")
-    print(f"最大延迟上限={MAX_LATENCY_MS}ms  保留节点数={MAX_NODES}  并发数={CONCURRENCY}")
+    print(f"最大延迟上限={MAX_LATENCY_MS}ms  运行超时上限={MAX_EXECUTION_TIME}s  并发数={CONCURRENCY}")
 
     if not os.path.exists(INPUT_FILE):
         print(f"错误: 未找到输入文件 {INPUT_FILE}")
@@ -250,19 +250,31 @@ async def main() -> None:
     print(f"待检测唯一节点数: {len(nodes)}")
 
     sem = asyncio.Semaphore(CONCURRENCY)
-    tasks = [check_one(n, sem) for n in nodes]
+    task_objs = [asyncio.create_task(check_one(n, sem)) for n in nodes]
 
     print(f"开始检测 (TCP 超时 {TCP_TIMEOUT}s / SSL 超时 {SSL_TIMEOUT}s)...")
     start = time.time()
     valid = []
     done = 0
-    total = len(tasks)
+    total = len(task_objs)
 
-    for coro in asyncio.as_completed(tasks):
-        res = await coro
-        done += 1
-        if res:
-            valid.append(res)
+    for coro in asyncio.as_completed(task_objs):
+        if time.time() - start > MAX_EXECUTION_TIME:
+            print(f"\n触发运行时间限制 ({MAX_EXECUTION_TIME} 秒)，终止剩余任务。")
+            for t in task_objs:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*task_objs, return_exceptions=True)
+            break
+
+        try:
+            res = await coro
+            done += 1
+            if res:
+                valid.append(res)
+        except asyncio.CancelledError:
+            pass
+
         if done % 50 == 0 or done == total:
             elapsed = time.time() - start
             speed = done / elapsed if elapsed > 0 else 0
@@ -276,13 +288,8 @@ async def main() -> None:
     udp_valid = [x for x in valid if x[1] >= 9000.0]
     tcp_valid.sort(key=lambda x: x[1])
 
-    if udp_valid:
-        max_udp = min(50, len(udp_valid))
-        max_tcp = MAX_NODES - max_udp
-        final_valid = tcp_valid[:max_tcp] + udp_valid[:max_udp]
-    else:
-        final_valid = tcp_valid[:MAX_NODES]
-
+    # 不做最大值上限截断，保留所有检测通过的 TCP 与 UDP 节点
+    final_valid = tcp_valid + udp_valid
     final = [x[0] for x in final_valid]
 
     try:
@@ -293,7 +300,7 @@ async def main() -> None:
         with open(SUB_FILE, "w", encoding="utf-8") as f:
             f.write(b64_data)
         print(f"检测完成，耗时 {time.time() - start:.1f} 秒")
-        print(f"实际存活节点: {len(valid)} 个，保留 Top {len(final)}")
+        print(f"实际存活并保留节点: {len(final)} 个")
         if valid:
             best = tcp_valid[0][1] if tcp_valid else 9999.0
             if best < 9000:
