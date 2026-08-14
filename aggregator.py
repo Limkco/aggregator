@@ -323,7 +323,6 @@ class NodeAggregator:
             except queue.Empty:
                 continue
 
-            # 只有获取任务成功后，才在 try...finally 确保 task_done 被执行
             try:
                 resp = self.session.get(url, timeout=TIMEOUT)
                 if resp.status_code != 200:
@@ -446,7 +445,9 @@ class NodeAggregator:
 
         logger.info("等待剩余下载任务完成 (上限 20 秒)...")
         deadline = time.time() + 20
-        while not self.url_queue.empty() and time.time() < deadline:
+        while time.time() < deadline:
+            if self.url_queue.unfinished_tasks == 0:
+                break
             time.sleep(0.4)
 
         self.should_stop = True
@@ -458,15 +459,17 @@ class NodeAggregator:
 
     def _save_results(self) -> None:
         """保存明文及 Base64 加密的节点列表到文件"""
-        logger.info(f"=== 最终有效去重节点总数: {len(self.nodes)} ===")
-        plain = "\n".join(self.nodes) if self.nodes else ""
+        with self.nodes_lock:
+            nodes_list = list(self.nodes)
+        logger.info(f"=== 最终有效去重节点总数: {len(nodes_list)} ===")
+        plain = "\n".join(nodes_list) if nodes_list else ""
         try:
             with open(RAW_OUTPUT_FILE, "w", encoding="utf-8") as f:
                 f.write(plain)
         except Exception as e:
             logger.error(f"保存明文文件失败: {e}")
             
-        if not self.nodes:
+        if not nodes_list:
             logger.warning("节点列表为空")
             return
             
