@@ -138,7 +138,7 @@ jobs:
               git config --local user.name "GitHub Action"
               git add GeoLite2-Country.mmdb
               git commit -m "Auto-update GeoLite2-Country.mmdb [skip ci]"
-              git push origin HEAD:${{ github.ref_name }}
+              git push origin HEAD:${{ github.ref_name }} || true
               echo "GeoIP database updated in repo."
             else
               echo "GeoIP already up-to-date."
