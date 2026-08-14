@@ -221,7 +221,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
             if not is_udp and latency > MAX_LATENCY_MS:
                 return None
 
-            cc = get_country(host)
+            cc = await asyncio.to_thread(get_country, host)
             latency_str = "UDP" if is_udp else f"{latency:.0f}ms"
             new_link = rebuild_link(link, cc, latency_str)
             return new_link, latency
@@ -272,8 +272,18 @@ async def main() -> None:
             sys.stdout.flush()
 
     print()
-    valid.sort(key=lambda x: x[1])
-    final = [x[0] for x in valid[:MAX_NODES]]
+    tcp_valid = [x for x in valid if x[1] < 9000.0]
+    udp_valid = [x for x in valid if x[1] >= 9000.0]
+    tcp_valid.sort(key=lambda x: x[1])
+
+    if udp_valid:
+        max_udp = min(50, len(udp_valid))
+        max_tcp = MAX_NODES - max_udp
+        final_valid = tcp_valid[:max_tcp] + udp_valid[:max_udp]
+    else:
+        final_valid = tcp_valid[:MAX_NODES]
+
+    final = [x[0] for x in final_valid]
 
     try:
         plain_data = "\n".join(final)
@@ -285,7 +295,7 @@ async def main() -> None:
         print(f"检测完成，耗时 {time.time() - start:.1f} 秒")
         print(f"实际存活节点: {len(valid)} 个，保留 Top {len(final)}")
         if valid:
-            best = valid[0][1]
+            best = tcp_valid[0][1] if tcp_valid else 9999.0
             if best < 9000:
                 print(f"最优延迟: {best:.1f}ms")
             else:
