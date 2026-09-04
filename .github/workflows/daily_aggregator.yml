@@ -2,7 +2,7 @@ name: Aggregator Daily Build
 
 on:
   schedule:
-    # 每天 UTC 02:00 和 14:00 各运行一次（北京时间 10:00 和 22:00，避开高峰期）
+    # 每天 UTC 02:00 和 14:00 各运行一次（北京时间 10:00 和 22:00）
     - cron: '0 2,14 * * *'
   workflow_dispatch: # 支持手动点击执行
 
@@ -19,16 +19,32 @@ jobs:
         with:
           fetch-depth: 0 # 完整拉取历史以确保安全 Push
 
-      - name: 配置 Python 环境
+      # ================== 自动准备依赖清单 ==================
+      - name: 检查并自动创建 requirements.txt 清单
+        run: |
+          if [ ! -f requirements.txt ]; then
+            echo "未检测到 requirements.txt，自动生成以供缓存比对..."
+            cat << 'EOF' > requirements.txt
+requests
+PyYAML
+maxminddb
+EOF
+            echo "requirements.txt 自动生成完成。"
+          else
+            echo "已存在 requirements.txt，跳过创建。"
+          fi
+
+      # ================== 配置 Python 并启用 Pip 缓存 ==================
+      - name: 配置 Python 环境 (已启用 Pip 缓存)
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: 'pip' # setup-python 将读取上一步生成的 requirements.txt 自动恢复/建立缓存
 
-      - name: 安装必要依赖
+      - name: 安装必要依赖 (命中缓存时将秒级完成)
         run: |
           python -m pip install --upgrade pip
-          pip install requests PyYAML maxminddb
+          pip install -r requirements.txt
 
       # ================== 阶段 1：采集新鲜节点 ==================
       - name: 1. 抓取 GitHub 最新活跃节点
@@ -83,7 +99,7 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Runner"
 
-          # 4. 仅精准追踪 result 目录，避免把临时日志或 mmdb 提交进去
+          # 4. 仅精准追踪 result 目录（动态生成的 requirements.txt 不会被推入仓库）
           git add result/nodes.txt result/sub.txt
 
           # 5. 检查是否有变动，若有变动则提交并推送到当前分支
