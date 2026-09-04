@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""节点聚合器: 搜索 GitHub 上的代理配置，提取并去重节点。"""
+"""
+节点聚合器 (完整增强版):
+1. 保留原版完整的 Clash YAML / JSON 结构化节点转换为链接的功能。
+2. 继承原版完善的 GitHub 速率保护、配额控制、Base64 订阅生成。
+3. 增加入库前深度清洗：自动拦截内网保留 IP、虚假域名、畸形 UUID、无效端口。
+"""
 
 import os
 import re
@@ -11,6 +16,8 @@ import logging
 import threading
 import queue
 import hashlib
+import ipaddress
+from datetime import datetime, timedelta
 from urllib.parse import quote, urlparse, parse_qs, unquote
 from typing import List, Set, Dict, Any, Optional, Union
 
@@ -26,9 +33,9 @@ except ImportError:
 # ==================== 全局配置 ====================
 KEYWORDS_GROUPS: List[List[str]] = [
     ["vmess://", "vless://", "trojan://"],
-    ["ss://", "shadowsocks", "hysteria2", "hy://"],
+    ["ss://", "shadowsocks", "hysteria2", "hy2://"],
     ["proxies", "clash", "subscription", "sub"],
-    ["v2ray", "config", "节点", "机场", "翻墙"],
+    ["v2ray share", "free nodes", "节点订阅"],
 ]
 EXTENSIONS: List[str] = ["yaml", "yml", "txt"]
 MAX_PAGES: int = 2
@@ -45,8 +52,30 @@ LINK_PATTERN = re.compile(
     r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\'`]+',
     re.IGNORECASE
 )
+UUID_PATTERN = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
 
-# 日志格式配置
+# 拦截内网及本地保留 IP 网段
+RESERVED_NETS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+# 拦截常见测试、占位虚假域名
+FAKE_DOMAINS = {
+    "example.com", "yourdomain.com", "mydomain.com", "domain.com",
+    "test.com", "sample.com", "localhost"
+}
+
+# 日志格式
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -55,38 +84,51 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def is_invalid_host(host: str) -> bool:
+    """检查域名或 IP 是否为无效/保留地址"""
+    if not host:
+        return True
+    host = host.strip().lower()
+    if host in FAKE_DOMAINS or host.endswith(".local") or host.endswith(".internal"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return any(ip in net for net in RESERVED_NETS)
+    except ValueError:
+        return False
+
+
 class NodeAggregator:
     """节点收集与去重核心类"""
 
     def __init__(self, token: Optional[str]):
         self.github_token = token
-        self.nodes: Set[str] = set()               # 最终有效节点集合
-        self.seen_hashes: Set[str] = set()          # 节点特征 Hash 集合（用于去重）
-        self.content_hashes: Set[str] = set()       # 文件内容 Hash 集合（避免重复解析相同文件）
-        self.nodes_lock = threading.Lock()         # 线程安全锁
+        self.nodes: Set[str] = set()
+        self.seen_hashes: Set[str] = set()
+        self.content_hashes: Set[str] = set()
+        self.nodes_lock = threading.Lock()
         self.session = self._init_session()
         self._setup_headers()
         self.start_time = time.time()
         self.should_stop = False
-        self.url_queue: queue.Queue = queue.Queue() # 待下载 URL 队列
+        self.url_queue: queue.Queue = queue.Queue()
         self.sleep_interval = SEARCH_INTERVAL if token else 12.0
-        
+
         if not token:
-            logger.warning("未检测到 GH_TOKEN，开启低速模式 (12s/请求)")
+            logger.warning("未检测到 GH_TOKEN，开启低速安全模式 (12s/请求)")
         if not yaml:
-            logger.warning("未安装 PyYAML，YAML 解析功能已禁用")
+            logger.warning("未检测到 PyYAML 库，Clash YAML 解析功能已受限")
 
     def _init_session(self) -> requests.Session:
-        """初始化带有自动重试与连接池的 Requests Session"""
         session = requests.Session()
         retry = Retry(
-            total=2, 
-            backoff_factor=0.6, 
+            total=2,
+            backoff_factor=0.6,
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["GET"]
         )
         adapter = HTTPAdapter(
-            max_retries=retry, 
+            max_retries=retry,
             pool_connections=DOWNLOAD_WORKERS,
             pool_maxsize=DOWNLOAD_WORKERS
         )
@@ -95,27 +137,22 @@ class NodeAggregator:
         return session
 
     def _setup_headers(self) -> None:
-        """设置 GitHub API 请求头"""
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Mozilla/5.0 (compatible; NodeAggregator/2.2)",
+            "User-Agent": "Mozilla/5.0 (compatible; HighQualityNodeAggregator/3.0)",
         })
         if self.github_token:
             self.session.headers["Authorization"] = f"token {self.github_token}"
-            logger.info("已加载 GitHub Token")
+            logger.info("已成功装载 GitHub Token")
 
     def check_timeout(self) -> bool:
-        """检查程序执行时间是否超出安全阈值"""
         return time.time() - self.start_time > MAX_EXECUTION_TIME
 
     def safe_base64_decode(self, text: str) -> Optional[str]:
-        """安全解码 Base64 字符串，包含自动补全与 URL 安全字符替换"""
         if not text:
             return None
         text = text.strip().replace(" ", "").replace("\n", "").replace("\r", "")
-        text = unquote(text)  # 容错处理 URL 编码字符
-        text = text.replace("-", "+").replace("_", "/")
-        
+        text = unquote(text).replace("-", "+").replace("_", "/")
         pad = len(text) % 4
         if pad:
             text += "=" * (4 - pad)
@@ -125,17 +162,14 @@ class NodeAggregator:
             return None
 
     def _get_node_hash(self, link: str) -> str:
-        """
-        根据节点链接提取核心特征（协议、核心配置/地址、SNI/Host）并计算 MD5，
-        忽略备注名（ps/remark）等无用变动，实现精准语义去重。
-        """
+        """提取节点核心特征生成哈希，避免别名变动造成重复"""
         link = link.strip()
         if "://" not in link:
             return hashlib.md5(link.encode()).hexdigest()
         try:
             protocol, rest = link.split("://", 1)
             protocol = protocol.lower()
-            core = rest.split("#")[0]  # 移除备注
+            core = rest.split("#")[0]
             sni = None
 
             if protocol == "vmess":
@@ -143,7 +177,7 @@ class NodeAggregator:
                 if decoded:
                     conf = json.loads(decoded)
                     sni = conf.get("sni") or conf.get("host") or conf.get("add")
-                    conf.pop("ps", None)  # 移除节点别名以进行纯净去重
+                    conf.pop("ps", None)
                     core = json.dumps(conf, sort_keys=True)
             else:
                 parsed = urlparse(link)
@@ -154,10 +188,7 @@ class NodeAggregator:
                 if not sni and "@" in rest:
                     body = rest.split("#")[0]
                     part = body.split("@")[-1].split("/?")[0].split("?")[0]
-                    if part.startswith("["):
-                        sni = part.rsplit(":", 1)[0].strip("[]")
-                    else:
-                        sni = part.rsplit(":", 1)[0]
+                    sni = part.rsplit(":", 1)[0].strip("[]")
 
             feature_str = f"{protocol}://{core}"
             if sni:
@@ -167,20 +198,22 @@ class NodeAggregator:
             return hashlib.md5(link.encode()).hexdigest()
 
     def _build_vmess_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将结构化字典构建为 VMess 节点链接"""
+        """将 Clash YAML 的 VMess 配置转换为 vmess:// 标准链接"""
         try:
-            server = config.get("server")
-            port = config.get("port")
-            uuid_val = config.get("uuid")
-            if not server or not port or not uuid_val:
+            server = str(config.get("server", "")).strip()
+            port = int(config.get("port", 0))
+            uuid_val = str(config.get("uuid", "")).strip()
+            if not (1 <= port <= 65535) or is_invalid_host(server):
+                return None
+            if not UUID_PATTERN.match(uuid_val) or uuid_val.startswith("00000000"):
                 return None
 
             v = {
                 "v": "2",
-                "ps": str(config.get("name", "unnamed")),
-                "add": str(server),
+                "ps": str(config.get("name", "vmess")),
+                "add": server,
                 "port": str(port),
-                "id": str(uuid_val),
+                "id": uuid_val,
                 "aid": str(config.get("alterId", 0)),
                 "scy": str(config.get("cipher", "auto")),
                 "net": str(config.get("network", "tcp")),
@@ -195,13 +228,13 @@ class NodeAggregator:
             return None
 
     def _build_ss_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将结构化字典构建为 Shadowsocks 节点链接"""
+        """将 Clash YAML 的 SS 配置转换为 ss:// 链接"""
         try:
-            server, port, password, method = (
-                config.get("server"), config.get("port"),
-                config.get("password"), config.get("cipher")
-            )
-            if not all([server, port, password, method]):
+            server = str(config.get("server", "")).strip()
+            port = int(config.get("port", 0))
+            password = str(config.get("password", "")).strip()
+            method = str(config.get("cipher", "")).strip()
+            if not (1 <= port <= 65535) or is_invalid_host(server) or not password or not method:
                 return None
             user = base64.b64encode(f"{method}:{password}".encode("utf-8")).decode("utf-8").strip()
             return f"ss://{user}@{server}:{port}#{quote(str(config.get('name', 'ss')))}"
@@ -209,10 +242,12 @@ class NodeAggregator:
             return None
 
     def _build_trojan_link(self, config: Dict[str, Any]) -> Optional[str]:
-        """将结构化字典构建为 Trojan 节点链接"""
+        """将 Clash YAML 的 Trojan 配置转换为 trojan:// 链接"""
         try:
-            server, port, password = config.get("server"), config.get("port"), config.get("password")
-            if not all([server, port, password]):
+            server = str(config.get("server", "")).strip()
+            port = int(config.get("port", 0))
+            password = str(config.get("password", "")).strip()
+            if not (1 <= port <= 65535) or is_invalid_host(server) or not password:
                 return None
             sni = config.get("sni") or config.get("servername")
             q = f"?peer={sni}" if sni else ""
@@ -221,7 +256,7 @@ class NodeAggregator:
             return None
 
     def _parse_structured_node(self, item: Dict[str, Any]) -> Optional[str]:
-        """解析单条结构化节点数据"""
+        """解析 Clash/JSON 单条代理配置"""
         if not isinstance(item, dict):
             return None
         proto = str(item.get("type", "")).lower()
@@ -234,7 +269,7 @@ class NodeAggregator:
         return None
 
     def _extract_from_structured(self, data: Union[Dict, List]) -> List[str]:
-        """从 JSON/YAML 结构化对象中提取节点"""
+        """从结构化数据（如 Clash 的 proxies 列表）提取节点"""
         proxies = []
         if isinstance(data, dict) and isinstance(data.get("proxies"), list):
             proxies = data["proxies"]
@@ -243,7 +278,7 @@ class NodeAggregator:
         return [n for item in proxies if (n := self._parse_structured_node(item))]
 
     def _clean_link(self, raw: str) -> str:
-        """清除提取出的链接末尾或首部的闭合符号与废字符"""
+        """剔除链接前后多余的闭合符号、HTML标记与逗号分号"""
         m = raw.strip()
         while m and m[0] in ('"', "'", '<', '(', '['):
             m = m[1:]
@@ -262,22 +297,55 @@ class NodeAggregator:
             m = m[:-1]
         return m
 
+    def _validate_link(self, link: str) -> bool:
+        """严格校验提取出来的节点链接，杜绝假节点进入后续测试环节"""
+        if len(link) < 20 or "://" not in link:
+            return False
+        try:
+            proto, rest = link.split("://", 1)
+            proto = proto.lower()
+            if proto == "vmess":
+                conf_str = self.safe_base64_decode(rest.split("#")[0])
+                if not conf_str:
+                    return False
+                c = json.loads(conf_str)
+                host = str(c.get("add", "")).strip()
+                port = int(c.get("port", 0))
+                uid = str(c.get("id", "")).strip()
+                if not (1 <= port <= 65535) or is_invalid_host(host):
+                    return False
+                if not UUID_PATTERN.match(uid) or uid.startswith("00000000"):
+                    return False
+            else:
+                p = urlparse(link)
+                if not p.hostname or not p.port or not (1 <= p.port <= 65535):
+                    return False
+                if is_invalid_host(p.hostname):
+                    return False
+                if proto == "vless":
+                    uid = str(p.username or "")
+                    if not UUID_PATTERN.match(uid) or uid.startswith("00000000"):
+                        return False
+            return True
+        except Exception:
+            return False
+
     def extract_nodes(self, text: str) -> List[str]:
-        """从文本中综合提取节点（支持 JSON/YAML/明文/Base64）"""
+        """综合提取节点：支持 Clash YAML、JSON、纯文本正则与 Base64"""
         if not text:
             return []
 
         found: List[str] = []
         stripped = text.strip()
 
-        # 尝试结构化解析 (JSON / YAML)
+        # 1. 尝试解析 Clash YAML / JSON 结构化数据
         parsed = None
         if stripped.startswith(('{', '[')):
             try:
                 parsed = json.loads(stripped)
             except json.JSONDecodeError:
                 pass
-        if parsed is None and ("proxies:" in stripped or "name:" in stripped) and yaml:
+        if parsed is None and ("proxies:" in stripped or "proxy-groups:" in stripped) and yaml:
             try:
                 parsed = yaml.safe_load(stripped)
             except Exception:
@@ -285,38 +353,40 @@ class NodeAggregator:
         if parsed:
             found.extend(self._extract_from_structured(parsed))
 
-        # 文本清理（还原转义字符）
-        clean_text = (text
-                      .replace('&amp;', '&')
-                      .replace('\\u0026', '&')
-                      .replace('\\/', '/')
-                      .replace('\\"', '"')
-                      .replace('\\\\', '\\'))
+        # 2. 文本清洗与反转义
+        clean_text = (
+            text.replace('&amp;', '&')
+            .replace('\\u0026', '&')
+            .replace('\\/', '/')
+            .replace('\\"', '"')
+            .replace('\\\\', '\\')
+        )
 
-        # 正则直接提取
+        # 3. 正则扫描直接明文链接
         for match in LINK_PATTERN.findall(clean_text):
-            link = self._clean_link(match)
-            if len(link) > 20:
-                found.append(link)
+            cleaned = self._clean_link(match)
+            if self._validate_link(cleaned):
+                found.append(cleaned)
 
-        # Base64 解密后再尝试提取
+        # 4. 尝试 Base64 订阅全文解密再扫描
         decoded = self.safe_base64_decode(text)
         if decoded:
-            d_clean = (decoded
-                       .replace('&amp;', '&')
-                       .replace('\\u0026', '&')
-                       .replace('\\/', '/')
-                       .replace('\\"', '"')
-                       .replace('\\\\', '\\'))
+            d_clean = (
+                decoded.replace('&amp;', '&')
+                .replace('\\u0026', '&')
+                .replace('\\/', '/')
+                .replace('\\"', '"')
+                .replace('\\\\', '\\')
+            )
             for match in LINK_PATTERN.findall(d_clean):
-                link = self._clean_link(match)
-                if len(link) > 20:
-                    found.append(link)
+                cleaned = self._clean_link(match)
+                if self._validate_link(cleaned):
+                    found.append(cleaned)
 
-        return list({n for n in found if len(n) > 20 and "://" in n})
+        return found
 
     def fetch_worker(self) -> None:
-        """消费者工作线程：从队列拉取 URL 并进行抓取、提取和去重"""
+        """并发抓取工作线程"""
         while not self.should_stop:
             try:
                 url = self.url_queue.get(timeout=1)
@@ -329,28 +399,26 @@ class NodeAggregator:
                     continue
                 content = resp.content
                 c_hash = hashlib.md5(content).hexdigest()
-                
+
                 with self.nodes_lock:
                     if c_hash in self.content_hashes:
                         continue
                     self.content_hashes.add(c_hash)
 
-                nodes = self.extract_nodes(content.decode("utf-8", errors="ignore"))
+                nodes = self.extract_nodes(resp.text)
                 if not nodes:
                     continue
 
                 with self.nodes_lock:
                     before = len(self.nodes)
                     for node in nodes:
-                        if len(node) < 20 or "://" not in node:
-                            continue
                         h = self._get_node_hash(node)
                         if h not in self.seen_hashes:
                             self.seen_hashes.add(h)
                             self.nodes.add(node)
 
                     if len(self.nodes) > before and len(self.nodes) % 100 == 0:
-                        logger.info(f"去重节点数: {len(self.nodes)}")
+                        logger.info(f"已收集有效格式节点: {len(self.nodes)}")
                     if len(self.nodes) >= TARGET_NODES:
                         self.should_stop = True
             except Exception:
@@ -359,9 +427,11 @@ class NodeAggregator:
                 self.url_queue.task_done()
 
     def search_producer(self) -> None:
-        """生产者线程：调用 GitHub Search API，生成 Raw 文件下载 URL 并入队"""
-        logger.info(f"开始搜索，共 {len(KEYWORDS_GROUPS)} 组关键词")
+        """调用 GitHub Search API，结合时效性过滤提升质量"""
+        logger.info(f"开始执行 GitHub 搜索任务，关键词组数: {len(KEYWORDS_GROUPS)}")
         consecutive_limits = 0
+        # 仅搜索最近 14 天有更新的代码，大幅淘汰历史陈旧死库
+        pushed_filter = (datetime.utcnow() - timedelta(days=14)).strftime("%Y-%m-%d")
 
         for group in KEYWORDS_GROUPS:
             if self.should_stop or self.check_timeout():
@@ -377,12 +447,13 @@ class NodeAggregator:
                 for page in range(1, MAX_PAGES + 1):
                     if self.should_stop or self.check_timeout():
                         self.should_stop = True
-                        logger.warning("达到超时上限或目标节点数，停止搜索")
                         return
 
-                    query = f"{kw_part} extension:{ext}"
-                    api = (f"https://api.github.com/search/code?q={query}"
-                           f"&per_page=30&page={page}&sort=indexed&order=desc")
+                    query = f"{kw_part} extension:{ext} pushed:>{pushed_filter}"
+                    api = (
+                        f"https://api.github.com/search/code?q={quote(query)}"
+                        f"&per_page=30&page={page}&sort=indexed&order=desc"
+                    )
 
                     success = False
                     for attempt in range(2):
@@ -390,65 +461,62 @@ class NodeAggregator:
                             return
                         try:
                             resp = self.session.get(api, timeout=12)
-
                             if resp.status_code in (403, 429):
                                 consecutive_limits += 1
                                 if consecutive_limits >= 3:
-                                    logger.warning("连续 3 次触发速率限制，停止搜索")
+                                    logger.warning("连续触发 GitHub 速率限制，为保护 Token 停止搜索")
                                     self.should_stop = True
                                     return
-                                wait = 20 + attempt * 5
-                                logger.warning(f"触发速率限制，等待 {wait} 秒后重试")
+                                wait = 20 + attempt * 10
+                                logger.warning(f"触发速率限制，等待 {wait} 秒...")
                                 time.sleep(wait)
                                 break
 
                             if resp.status_code == 200:
                                 consecutive_limits = 0
                                 items = resp.json().get("items", [])
-                                logger.info(f"[{query[:60]}...] 页码 {page} -> 发现 {len(items)} 个文件")
+                                logger.info(f"[{query[:50]}...] 页码 {page} -> 命中 {len(items)} 个文件")
                                 if items:
                                     found_any = True
                                     for it in items:
                                         html = it.get("html_url")
                                         if html:
-                                            raw = (html.replace("github.com", "raw.githubusercontent.com")
-                                                       .replace("/blob/", "/"))
+                                            raw = (
+                                                html.replace("github.com", "raw.githubusercontent.com")
+                                                .replace("/blob/", "/")
+                                            )
                                             self.url_queue.put(raw)
                                 success = True
                                 break
 
-                            logger.error(f"API 响应状态码错误: {resp.status_code}")
+                            logger.error(f"API 响应错误: {resp.status_code}")
                             break
                         except Exception as e:
-                            logger.error(f"搜索发生异常: {e}")
+                            logger.error(f"搜索请求异常: {e}")
                             time.sleep(2)
 
-                    time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 0.6))
-
+                    time.sleep(random.uniform(self.sleep_interval, self.sleep_interval + 0.5))
                     if success and not found_any:
                         break
 
-        logger.info("搜索流程执行结束")
+        logger.info("GitHub API 检索生产流程结束")
 
     def run(self) -> None:
-        """程序入口方法：启动下载工作线程，执行搜索，等待结束并保存结果"""
-        logger.info(f"启动 {DOWNLOAD_WORKERS} 个下载线程")
+        logger.info(f"启动 {DOWNLOAD_WORKERS} 个下载工作线程")
         for _ in range(DOWNLOAD_WORKERS):
-            t = threading.Thread(target=self.fetch_worker, daemon=True)
-            t.start()
+            threading.Thread(target=self.fetch_worker, daemon=True).start()
 
         try:
             self.search_producer()
         except KeyboardInterrupt:
-            logger.warning("收到手动终止指令")
             self.should_stop = True
 
-        logger.info("等待剩余下载任务完成 (上限 20 秒)...")
-        deadline = time.time() + 20
+        logger.info("等待抓取队列剩余任务结算 (上限 25 秒)...")
+        deadline = time.time() + 25
         while time.time() < deadline:
             if self.url_queue.unfinished_tasks == 0:
                 break
-            time.sleep(0.4)
+            time.sleep(0.5)
 
         self.should_stop = True
         self._save_results()
@@ -458,28 +526,28 @@ class NodeAggregator:
             pass
 
     def _save_results(self) -> None:
-        """保存明文及 Base64 加密的节点列表到文件"""
         with self.nodes_lock:
             nodes_list = list(self.nodes)
-        logger.info(f"=== 最终有效去重节点总数: {len(nodes_list)} ===")
+        logger.info(f"=== 最终入库唯一高阶格式节点总数: {len(nodes_list)} ===")
+
         plain = "\n".join(nodes_list) if nodes_list else ""
         try:
             with open(RAW_OUTPUT_FILE, "w", encoding="utf-8") as f:
                 f.write(plain)
         except Exception as e:
-            logger.error(f"保存明文文件失败: {e}")
-            
+            logger.error(f"保存明文节点文件失败: {e}")
+
         if not nodes_list:
-            logger.warning("节点列表为空")
+            logger.warning("本次未收集到有效节点")
             return
-            
+
         try:
             b64 = base64.b64encode(plain.encode("utf-8")).decode("utf-8")
             with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                 f.write(b64)
-            logger.info(f"已成功写入 {OUTPUT_FILE} 与 {RAW_OUTPUT_FILE}")
+            logger.info(f"已同步输出明文 {RAW_OUTPUT_FILE} 与 Base64 订阅 {OUTPUT_FILE}")
         except Exception as e:
-            logger.error(f"保存 Base64 订阅文件失败: {e}")
+            logger.error(f"保存 Base64 订阅失败: {e}")
 
 
 if __name__ == "__main__":
