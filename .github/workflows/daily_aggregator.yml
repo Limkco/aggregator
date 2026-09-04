@@ -4,9 +4,8 @@ on:
   schedule:
     # 每天 UTC 02:00 和 14:00 各运行一次（北京时间 10:00 和 22:00）
     - cron: '0 2,14 * * *'
-  workflow_dispatch: # 支持手动点击执行
+  workflow_dispatch:
 
-# 赋予工作流向当前仓库分支推送代码的写权限
 permissions:
   contents: write
 
@@ -17,21 +16,18 @@ jobs:
       - name: 检出当前分支代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 完整拉取历史以确保安全 Push
+          fetch-depth: 0
 
       # ================== 自动准备依赖清单 ==================
       - name: 检查并自动创建 requirements.txt 清单
         run: |
           if [ ! -f requirements.txt ]; then
-            echo "未检测到 requirements.txt，自动生成以供缓存比对..."
-            cat << 'EOF' > requirements.txt
-requests
-PyYAML
-maxminddb
-EOF
-            echo "requirements.txt 自动生成完成。"
+            echo "未检测到 requirements.txt，使用 printf 安全生成..."
+            printf "requests\nPyYAML\nmaxminddb\n" > requirements.txt
+            echo "requirements.txt 创建成功，内容如下："
+            cat requirements.txt
           else
-            echo "已存在 requirements.txt，跳过创建。"
+            echo "已检测到 requirements.txt，跳过生成。"
           fi
 
       # ================== 配置 Python 并启用 Pip 缓存 ==================
@@ -39,9 +35,9 @@ EOF
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # setup-python 将读取上一步生成的 requirements.txt 自动恢复/建立缓存
+          cache: 'pip'
 
-      - name: 安装必要依赖 (命中缓存时将秒级完成)
+      - name: 安装必要依赖
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -62,7 +58,7 @@ EOF
           fi
 
       # ================== 阶段 3：深度测活 ==================
-      - name: 3. 准备 GeoIP 离线数据库 (仅本次运行时使用，不入库)
+      - name: 3. 准备 GeoIP 离线数据库
         run: |
           echo "下载最新 GeoLite2-Country 数据库..."
           if ! wget -T 15 -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
@@ -70,7 +66,7 @@ EOF
             [ -f GeoLite2-Country.mmdb ] && cp GeoLite2-Country.mmdb geoip.mmdb || true
           fi
 
-      - name: 4. 执行深度测活 (TCP/TLS/WS握手嗅探，淘汰假存活)
+      - name: 4. 执行深度测活 (TCP/TLS/WS握手嗅探)
         run: |
           python check_active.py
 
@@ -88,25 +84,19 @@ EOF
       # ================== 阶段 5：保存至当前分支 result 目录 ==================
       - name: 6. 提交最终节点至当前分支 result 目录
         run: |
-          # 1. 自动检查并新建 result 目录
           mkdir -p result
-
-          # 2. 复制明文节点并生成 Base64 订阅文件
           cp nodes.txt result/nodes.txt
           base64 -w 0 nodes.txt > result/sub.txt
 
-          # 3. 配置 Git 信息
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Runner"
 
-          # 4. 仅精准追踪 result 目录（动态生成的 requirements.txt 不会被推入仓库）
           git add result/nodes.txt result/sub.txt
 
-          # 5. 检查是否有变动，若有变动则提交并推送到当前分支
           if git diff --staged --quiet; then
             echo "节点内容无变化，无需提交。"
           else
             git commit -m "Auto-update verified nodes [$(date -u '+%Y-%m-%d %H:%M:%S UTC')] [skip ci]"
             git push origin HEAD:${{ github.ref_name }}
-            echo "成功推送到当前分支的 result/ 目录！"
+            echo "成功更新并推送到当前分支的 result/ 目录！"
           fi
