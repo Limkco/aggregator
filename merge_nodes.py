@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge new nodes with previous release nodes and deduplicate by feature hash."""
+"""节点指纹合并器：规范化节点，防止重复并剔除畸形链接。"""
 
 import os
 import json
@@ -15,8 +15,7 @@ OUTPUT_FILE = "nodes.txt"
 def safe_b64decode(text: str) -> str | None:
     if not text:
         return None
-    text = text.strip().replace(" ", "").replace("\n", "").replace("\r", "")
-    text = text.replace("-", "+").replace("_", "/")
+    text = text.strip().replace("-", "+").replace("_", "/")
     pad = len(text) % 4
     if pad:
         text += "=" * (4 - pad)
@@ -47,31 +46,19 @@ def get_node_hash(link: str) -> str:
         else:
             parsed = urlparse(link)
             qs = parse_qs(parsed.query)
-            sni = (qs.get("sni") or qs.get("peer") or [None])[0]
-            if not sni:
-                sni = parsed.hostname
-            if not sni and "@" in rest:
-                body = rest.split("#")[0]
-                part = body.split("@")[-1].split("/?")[0].split("?")[0]
-                if part.startswith("["):
-                    sni = part.rsplit(":", 1)[0].strip("[]")
-                else:
-                    sni = part.rsplit(":", 1)[0]
+            sni = (qs.get("sni") or qs.get("peer") or [parsed.hostname])[0]
 
-        # 特征哈希：综合考虑协议、核心网络配置与 SNI，避免单一 SNI 误杀同 CDN 的不同节点
-        feature_str = f"{protocol}://{core}"
-        if sni:
-            feature_str += f"?sni={sni}"
+        feature_str = f"{protocol}://{core}" + (f"?sni={sni}" if sni else "")
         return hashlib.md5(feature_str.encode()).hexdigest()
     except Exception:
         return hashlib.md5(link.encode()).hexdigest()
 
 
 def main() -> None:
-    print("--- Merge & deduplicate nodes ---")
     seen: set[str] = set()
     unique: list[str] = []
 
+    # 优先合并当前新检测存活的节点，再补充旧节点
     files = [INPUT_RAW]
     if os.path.exists(INPUT_PREV):
         files.append(INPUT_PREV)
@@ -89,7 +76,7 @@ def main() -> None:
                     seen.add(h)
                     unique.append(link)
 
-    print(f"Unique nodes after merge: {len(unique)}")
+    print(f"合并去重后保留核心节点: {len(unique)}")
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(unique))
 
