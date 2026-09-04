@@ -2,172 +2,95 @@ name: Aggregator Daily Build
 
 on:
   schedule:
-    # 每 10 天 UTC 0:00 运行（北京时间 8:00）
-    - cron: '0 0 * * *'
-  workflow_dispatch:
-    inputs:
-      force_crawl:
-        description: '强制重新爬取（无视已有 raw-nodes）'
-        required: false
-        type: boolean
-        default: false
+    # 每天 UTC 02:00 和 14:00 各运行一次（北京时间 10:00 和 22:00，避开高峰期）
+    - cron: '0 2,14 * * *'
+  workflow_dispatch: # 支持手动点击执行
 
+# 赋予工作流向当前仓库分支推送代码的写权限
 permissions:
   contents: write
-  actions: read
 
 jobs:
-  # ---------- 第一阶段：搜索与聚合 ----------
-  fetch_raw:
+  build_and_check:
     runs-on: ubuntu-latest
-    outputs:
-      skip_crawl: ${{ steps.check_artifact.outputs.skip_crawl }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@main
+      - name: 检出当前分支代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 完整拉取历史以确保安全 Push
 
-      - name: Check existing raw-nodes artifact
-        id: check_artifact
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装必要依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests PyYAML maxminddb
+
+      # ================== 阶段 1：采集新鲜节点 ==================
+      - name: 1. 抓取 GitHub 最新活跃节点
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event.inputs.force_crawl }}" = "true" ]; then
-            echo "Force crawl enabled, skip artifact restore."
-            echo "skip_crawl=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          echo "开始抓取最新代码库中的节点..."
+          python aggregator.py
 
-          echo "Looking for previous raw-nodes artifact..."
-          WORKFLOW_FILE=$(basename "${{ github.workflow_ref }}" | cut -d'@' -f1)
-          PREV_RUN_ID=$(gh run list --workflow "$WORKFLOW_FILE" --json databaseId \
-            --jq '[.[] | select(.databaseId != ${{ github.run_id }})] | .[0].databaseId // empty' || true)
-
-          if [ -n "$PREV_RUN_ID" ]; then
-            echo "Previous run ID: $PREV_RUN_ID"
-            if gh run download "$PREV_RUN_ID" -n raw-nodes --dir . 2>/dev/null; then
-              echo "Restored raw-nodes, will skip crawl."
-              echo "skip_crawl=true" >> $GITHUB_OUTPUT
-            else
-              echo "Artifact expired or missing, need crawl."
-              echo "skip_crawl=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "No previous run found, need crawl."
-            echo "skip_crawl=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Setup Python
-        if: steps.check_artifact.outputs.skip_crawl != 'true'
-        uses: actions/setup-python@main
-        with:
-          python-version: 'x'
-
-      - name: Install dependencies
-        if: steps.check_artifact.outputs.skip_crawl != 'true'
-        run: pip install requests PyYAML
-
-      - name: Run aggregator
-        if: steps.check_artifact.outputs.skip_crawl != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python aggregator.py
-
-      - name: Upload raw-nodes artifact
-        uses: actions/upload-artifact@main
-        with:
-          name: raw-nodes
-          path: nodes.txt
-          retention-days: 1
-          overwrite: true
-          if-no-files-found: error
-
-  # ---------- 第二阶段：合并、过滤、测速、发布 ----------
-  check_active:
-    needs: fetch_raw
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@main
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@main
-        with:
-          python-version: 'x'
-
-      - name: Download raw-nodes
-        uses: actions/download-artifact@main
-        with:
-          name: raw-nodes
-
-      - name: Merge with previous release nodes
-        run: |
-          echo "Fetching previous nodes from release branch..."
-          if wget -qO previous_nodes.txt \
-            "https://raw.githubusercontent.com/${{ github.repository }}/release/nodes.txt"; then
-            echo "Previous nodes downloaded."
-            python merge_nodes.py
-            echo "Merge & dedup finished."
-          else
-            echo "No previous nodes (first run or missing), skip merge."
-          fi
-
-      - name: Filter by keywords
+      # ================== 阶段 2：粗筛清洗 ==================
+      - name: 2. 过滤广告、虚假配置与测试域名
         run: |
           if [ -f filter_nodes.py ]; then
             python filter_nodes.py
-            if [ -f nodes_filtered.txt ]; then
-              mv nodes_filtered.txt nodes.txt
-              echo "Keyword filter done."
-            fi
-          else
-            echo "filter_nodes.py not found, skip."
           fi
 
-      - name: Install maxminddb & update GeoIP
+      # ================== 阶段 3：深度测活 ==================
+      - name: 3. 准备 GeoIP 离线数据库 (仅本次运行时使用，不入库)
         run: |
-          pip install maxminddb
-          echo "Downloading latest GeoLite2-Country..."
-          if wget -T 15 -qO temp_geo.mmdb \
-            "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
-            mv temp_geo.mmdb GeoLite2-Country.mmdb
-            cp GeoLite2-Country.mmdb geoip.mmdb
-            if [ -n "$(git status --porcelain GeoLite2-Country.mmdb)" ]; then
-              git config --local user.email "action@github.com"
-              git config --local user.name "GitHub Action"
-              git add GeoLite2-Country.mmdb
-              git commit -m "Auto-update GeoLite2-Country.mmdb [skip ci]"
-              git push origin HEAD:${{ github.ref_name }} || true
-              echo "GeoIP database updated in repo."
-            else
-              echo "GeoIP already up-to-date."
-            fi
-          else
-            echo "Download failed, fallback to local."
-            rm -f temp_geo.mmdb
-            if [ -f GeoLite2-Country.mmdb ]; then
-              cp GeoLite2-Country.mmdb geoip.mmdb
-              echo "Using local GeoLite2-Country.mmdb"
-            else
-              echo "WARNING: No GeoIP database available."
-            fi
+          echo "下载最新 GeoLite2-Country 数据库..."
+          if ! wget -T 15 -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
+            echo "最新数据库下载超时，尝试使用仓库备用库..."
+            [ -f GeoLite2-Country.mmdb ] && cp GeoLite2-Country.mmdb geoip.mmdb || true
           fi
 
-      - name: Run active check
-        run: python check_active.py
-      
-      - name: Publish to release branch
+      - name: 4. 执行深度测活 (TCP/TLS/WS握手嗅探，淘汰假存活)
         run: |
-          mkdir -p publish_dir
-          cp sub.txt nodes.txt publish_dir/
-          cd publish_dir
-          git init
-          git checkout -b release
+          python check_active.py
+
+      # ================== 阶段 4：合并历史存活节点 ==================
+      - name: 5. 指纹合并（与当前分支上一期 result/nodes.txt 去重）
+        run: |
+          if [ -f result/nodes.txt ]; then
+            echo "发现本地历史 result/nodes.txt，复制进行保活合并..."
+            cp result/nodes.txt previous_nodes.txt
+            python merge_nodes.py
+          else
+            echo "未发现历史 result/nodes.txt（首次运行），跳过合并。"
+          fi
+
+      # ================== 阶段 5：保存至当前分支 result 目录 ==================
+      - name: 6. 提交最终节点至当前分支 result 目录
+        run: |
+          # 1. 自动检查并新建 result 目录
+          mkdir -p result
+
+          # 2. 复制明文节点并生成 Base64 订阅文件
+          cp nodes.txt result/nodes.txt
+          base64 -w 0 nodes.txt > result/sub.txt
+
+          # 3. 配置 Git 信息
           git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add .
-          git commit -m "Auto-update valid nodes [$(date -u +%Y-%m-%d)]" || exit 0
-          git push --force \
-            "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
-            release
+          git config --local user.name "GitHub Action Runner"
+
+          # 4. 仅精准追踪 result 目录，避免把临时日志或 mmdb 提交进去
+          git add result/nodes.txt result/sub.txt
+
+          # 5. 检查是否有变动，若有变动则提交并推送到当前分支
+          if git diff --staged --quiet; then
+            echo "节点内容无变化，无需提交。"
+          else
+            git commit -m "Auto-update verified nodes [$(date -u '+%Y-%m-%d %H:%M:%S UTC')] [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "成功推送到当前分支的 result/ 目录！"
+          fi
