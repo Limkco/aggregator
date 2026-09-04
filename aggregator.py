@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-节点聚合器 (双引擎增强版):
-1. 引擎一：直接从 GitHub 每日活跃更新的公共开源订阅源秒级抓取基础节点池（确保绝不为 0）。
-2. 引擎二：通过 GitHub 搜索 API (sort=indexed) 嗅探挖掘最新的散装分享配置。
-3. 具备完整的 Clash YAML / JSON / Base64 解析，并在入库前阻断内网和假数据。
+节点聚合器 (全动态自主发现版):
+1. 零固定依赖：完全不硬编码任何第三方死链或静态订阅。
+2. 动态仓库嗅探：利用 GitHub 仓库搜索原生支持的 pushed:> 语法，动态发现全网 7 天内活跃的项目。
+3. 候选文件树探测：自动探测活跃仓库中的常见配置/订阅文件、README、YAML 及 TXT。
+4. 纯净代码检索：使用官方合法语法，作为动态仓库探测的有力补充。
 """
 
 import os
@@ -11,14 +12,14 @@ import re
 import base64
 import json
 import time
-import random
 import logging
 import threading
 import queue
 import hashlib
 import ipaddress
+from datetime import datetime, timedelta
 from urllib.parse import quote, urlparse, parse_qs, unquote
-from typing import List, Set, Dict, Any, Optional, Union
+from typing import List, Set, Dict, Any, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -29,37 +30,41 @@ try:
 except ImportError:
     yaml = None
 
-# ==================== 配置区 ====================
-# 引擎一：高质量 GitHub 每日活跃开源订阅源（绝对兜底保障，杜绝 0 节点）
-DIRECT_RAW_SOURCES = [
-    "https://raw.githubusercontent.com/freefq/free/master/v2",
-    "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
-    "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
-    "https://raw.githubusercontent.com/ssrsub/ssr/master/v2ray",
-    "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
-    "https://raw.githubusercontent.com/mianfeifq/share/main/data.txt",
+# ==================== 顶部全局配置区 ====================
+# 动态嗅探的时间窗口（天数）：自动搜索过去 7 天内有代码提交/推送的活跃仓库
+SEARCH_DAYS: int = 7
+
+# 搜索全网活跃仓库的关键词
+REPO_SEARCH_KEYWORDS: List[str] = [
+    "v2ray node",
+    "clash subscription",
+    "free vmess",
+    "vless proxies",
+    "hysteria2 share",
+    "节点 订阅"
 ]
 
-# 引擎二：搜索关键词组
-KEYWORDS_GROUPS: List[List[str]] = [
-    ["vmess://", "vless://", "trojan://"],
-    ["ss://", "hysteria2://", "hy2://"],
-    ["proxies", "clash", "subscription"],
+# 常见包含节点的目标文件名模式（全自动动态拼接探测）
+CANDIDATE_FILENAMES: Set[str] = {
+    "nodes.txt", "sub.txt", "subscribe.txt", "v2ray.txt", "v2ray",
+    "clash.yaml", "config.yaml", "proxies.yaml", "data.txt", "share.txt", "README.md"
+}
+
+# 辅助纯代码检索关键词组（合法语法，杜绝非法参数）
+CODE_SEARCH_GROUPS: List[str] = [
+    'vmess:// extension:txt',
+    'vless:// extension:txt',
+    'trojan:// extension:txt',
+    'proxies extension:yaml'
 ]
-EXTENSIONS: List[str] = ["txt", "yaml"]
-MAX_PAGES: int = 1
+
 TIMEOUT: int = 10
 DOWNLOAD_WORKERS: int = 16
 RAW_OUTPUT_FILE: str = "nodes.txt"
 OUTPUT_FILE: str = "sub.txt"
 
-LINK_PATTERN = re.compile(
-    r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\'`]+',
-    re.IGNORECASE
-)
-UUID_PATTERN = re.compile(
-    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-)
+LINK_PATTERN = re.compile(r'(?:vmess|vless|ss|trojan|hysteria2|hy2)://[^\s<>"\'`]+', re.IGNORECASE)
+UUID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 
 RESERVED_NETS = [
     ipaddress.ip_network("0.0.0.0/8"),
@@ -83,6 +88,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_invalid_host(host: str) -> bool:
+    """拦截内网保留地址与常见模板虚假域名"""
     if not host:
         return True
     host = host.strip().lower()
@@ -95,10 +101,9 @@ def is_invalid_host(host: str) -> bool:
         return False
 
 
-class NodeAggregator:
+class DynamicNodeAggregator:
     def __init__(self, token: Optional[str]):
-        # Actions 自动提供的 ghs_ Token 不支持全局跨库搜索，避免负作用
-        self.github_token = token if (token and not token.startswith("ghs_")) else None
+        self.github_token = token
         self.nodes: Set[str] = set()
         self.seen_hashes: Set[str] = set()
         self.content_hashes: Set[str] = set()
@@ -119,11 +124,10 @@ class NodeAggregator:
     def _setup_headers(self) -> None:
         self.session.headers.update({
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Mozilla/5.0 (compatible; Aggregator/4.0)",
+            "User-Agent": "Mozilla/5.0 (NodeFinder/5.0)",
         })
         if self.github_token:
             self.session.headers["Authorization"] = f"token {self.github_token}"
-            logger.info("已装载用户 Personal Access Token")
 
     def safe_base64_decode(self, text: str) -> Optional[str]:
         if not text:
@@ -139,20 +143,16 @@ class NodeAggregator:
             return None
 
     def _get_node_hash(self, link: str) -> str:
-        link = link.strip()
-        if "://" not in link:
-            return hashlib.md5(link.encode()).hexdigest()
         try:
-            protocol, rest = link.split("://", 1)
-            protocol = protocol.lower()
+            proto, rest = link.split("://", 1)
             core = rest.split("#")[0]
-            if protocol == "vmess":
+            if proto.lower() == "vmess":
                 decoded = self.safe_base64_decode(core)
                 if decoded:
                     conf = json.loads(decoded)
                     conf.pop("ps", None)
                     core = json.dumps(conf, sort_keys=True)
-            return hashlib.md5(f"{protocol}://{core}".encode()).hexdigest()
+            return hashlib.md5(f"{proto.lower()}://{core}".encode()).hexdigest()
         except Exception:
             return hashlib.md5(link.encode()).hexdigest()
 
@@ -263,7 +263,7 @@ class NodeAggregator:
             except Exception:
                 pass
 
-        # 正则扫描明文
+        # 正则扫描明文链接
         clean_text = text.replace('&amp;', '&').replace('\\/', '/')
         for m in LINK_PATTERN.findall(clean_text):
             c = self._clean_link(m)
@@ -308,42 +308,76 @@ class NodeAggregator:
             finally:
                 self.url_queue.task_done()
 
+    def discover_active_repositories(self) -> None:
+        """核心策略 1：全网动态嗅探指定天数内有推送更新的开源仓库"""
+        since_date = (datetime.utcnow() - timedelta(days=SEARCH_DAYS)).strftime("%Y-%m-%d")
+        logger.info(f"【动态嗅探】开始扫描全网自 {since_date} (过去 {SEARCH_DAYS} 天) 以来更新的活跃代理仓库...")
+
+        for keyword in REPO_SEARCH_KEYWORDS:
+            if self.should_stop:
+                break
+            query = f"{keyword} pushed:>{since_date} fork:true"
+            api = f"https://api.github.com/search/repositories?q={quote(query)}&sort=updated&order=desc&per_page=15"
+            try:
+                resp = self.session.get(api, timeout=10)
+                if resp.status_code == 200:
+                    repos = resp.json().get("items", [])
+                    logger.info(f"关键词 [{keyword}] 命中 {len(repos)} 个活跃仓库")
+                    for repo in repos:
+                        default_branch = repo.get("default_branch", "main")
+                        full_name = repo.get("full_name")
+                        if not full_name:
+                            continue
+
+                        # 动态探测该仓库根目录下的候选文件
+                        for fname in CANDIDATE_FILENAMES:
+                            raw_url = f"https://raw.githubusercontent.com/{full_name}/{default_branch}/{fname}"
+                            self.url_queue.put(raw_url)
+                elif resp.status_code in (403, 429):
+                    logger.warning("仓库 API 触发频率限制，暂停 5 秒...")
+                    time.sleep(5)
+            except Exception as e:
+                logger.error(f"仓库扫描发生异常: {e}")
+            time.sleep(1.5)
+
+    def discover_via_code_search(self) -> None:
+        """核心策略 2：纯净代码即时检索（作为动态仓库探测的辅助通道）"""
+        logger.info("【代码即时检索】启动全网实时文件检索...")
+        for query in CODE_SEARCH_GROUPS:
+            if self.should_stop:
+                break
+            api = f"https://api.github.com/search/code?q={quote(query)}&sort=indexed&order=desc&per_page=20"
+            try:
+                resp = self.session.get(api, timeout=10)
+                if resp.status_code == 200:
+                    items = resp.json().get("items", [])
+                    logger.info(f"代码搜索 [{query}] 命中 {len(items)} 个文件")
+                    for it in items:
+                        html = it.get("html_url")
+                        if html:
+                            raw = html.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                            self.url_queue.put(raw)
+                elif resp.status_code in (403, 429):
+                    logger.warning("代码搜索 API 触发速率限制，平滑跳过")
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+
     def run(self) -> None:
-        # 1. 启动工作线程池
+        logger.info(f"启动 {DOWNLOAD_WORKERS} 个并发解析工作线程...")
         for _ in range(DOWNLOAD_WORKERS):
             threading.Thread(target=self.fetch_worker, daemon=True).start()
 
-        # 2. 引擎一：首先装载直接订阅源（秒级抓取几千基础节点）
-        logger.info(f"【引擎一】开始抓取 {len(DIRECT_RAW_SOURCES)} 个每日开源订阅源...")
-        for direct_url in DIRECT_RAW_SOURCES:
-            self.url_queue.put(direct_url)
+        # 1. 执行动态活跃仓库探测（过去 SEARCH_DAYS 天）
+        self.discover_active_repositories()
 
-        # 3. 引擎二：执行精准搜索（移除了错误的 pushed 参数）
-        logger.info("【引擎二】执行 GitHub 全网最新代码文件检索...")
-        for group in KEYWORDS_GROUPS:
-            kw = " OR ".join(f'"{k}"' if "://" in k else k for k in group)
-            for ext in EXTENSIONS:
-                query = f"{kw} extension:{ext}"
-                api = f"https://api.github.com/search/code?q={quote(query)}&per_page=30&page=1&sort=indexed&order=desc"
-                try:
-                    resp = self.session.get(api, timeout=12)
-                    if resp.status_code == 200:
-                        items = resp.json().get("items", [])
-                        logger.info(f"[{query[:35]}...] -> 命中 {len(items)} 个文件")
-                        for it in items:
-                            html = it.get("html_url")
-                            if html:
-                                raw = html.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-                                self.url_queue.put(raw)
-                    elif resp.status_code in (403, 429):
-                        logger.warning("搜索 API 触发速率限制，平滑跳过（已有引擎一兜底保证）")
-                        break
-                except Exception:
-                    pass
-                time.sleep(1.5)
+        # 2. 执行纯净代码即时检索
+        self.discover_via_code_search()
 
-        # 等待下载解析队列结算
-        deadline = time.time() + 25
+        # 等待下载队列处理完成
+        logger.info("等待所有动态探测到的资源下载与解析...")
+        deadline = time.time() + 30
         while time.time() < deadline and self.url_queue.unfinished_tasks > 0:
             time.sleep(0.5)
 
@@ -351,7 +385,7 @@ class NodeAggregator:
         with self.nodes_lock:
             nodes_list = list(self.nodes)
 
-        logger.info(f"=== 抓取汇总：成功获得规范节点 {len(nodes_list)} 个 ===")
+        logger.info(f"=== 动态探测完成！共获取格式有效节点: {len(nodes_list)} 个 ===")
         plain = "\n".join(nodes_list) if nodes_list else ""
         with open(RAW_OUTPUT_FILE, "w", encoding="utf-8") as f:
             f.write(plain)
@@ -361,4 +395,4 @@ class NodeAggregator:
 
 if __name__ == "__main__":
     token = os.environ.get("GH_TOKEN")
-    NodeAggregator(token).run()
+    DynamicNodeAggregator(token).run()
