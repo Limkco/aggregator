@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Active node checker: TCP + SSL latency test, GeoIP annotation, ranking."""
+"""Active node checker: TCP + SSL + WebSocket/HTTP probing + Real UDP check.
+
+深度健康检查：
+1. 识别 CDN 架构的 WS 节点，发送真实 WebSocket 握手协议，杜绝 Cloudflare 502/521 假活节点。
+2. 修复 Hysteria2 / UDP 盲放行漏洞，进行真实 UDP 探测与 ICMP 错误检测。
+3. 剔除私有保留 IP 及虚拟模板地址。
+"""
 
 import sys
 import os
@@ -13,7 +19,7 @@ import logging
 import socket
 import ipaddress
 from urllib.parse import urlparse, parse_qs, unquote, quote
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 
 assert sys.version_info >= (3, 11), "需要 Python 3.11 及以上版本"
 
@@ -28,20 +34,29 @@ INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes.txt"
 SUB_FILE = "sub.txt"
 
-MAX_EXECUTION_TIME = 300.0  # 最大运行时间限制 (秒)
-MAX_LATENCY_MS = 1500.0
-CONCURRENCY = 120
-TCP_TIMEOUT = 3.5
-SSL_TIMEOUT = 3.5
+MAX_EXECUTION_TIME = 360.0
+MAX_LATENCY_MS = 1800.0
+CONCURRENCY = 150
+CONNECT_TIMEOUT = 3.0
+PROBE_TIMEOUT = 2.5
 
-UUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 REMARK_CLEAN_RE = re.compile(r"(?:-[A-Za-z]{2,3}(?:\d+ms|UDP))+$")
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S"
-)
+# 私有/回环保留地址网段
+RESERVED_NETS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("NodeChecker")
 
 _dns_cache: Dict[str, Optional[str]] = {}
@@ -61,92 +76,117 @@ def safe_b64decode(text: str) -> str:
         return ""
 
 
-def get_country(host: str) -> str:
-    if not geo_reader or not host:
-        return "UNK"
-    if host in _geo_cache:
-        return _geo_cache[host]
+def is_ip(host: str) -> bool:
     try:
-        if host not in _dns_cache:
-            infos = socket.getaddrinfo(host, None)
-            _dns_cache[host] = infos[0][4][0] if infos else None
-        ip = _dns_cache[host]
-        if ip:
-            res = geo_reader.get(ip)
-            if res and "country" in res:
-                code = res["country"]["iso_code"]
-                _geo_cache[host] = code
-                return code
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def is_reserved(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return any(ip in net for net in RESERVED_NETS)
+    except ValueError:
+        return False
+
+
+def get_country(ip: str) -> str:
+    if not geo_reader or not ip:
+        return "UNK"
+    if ip in _geo_cache:
+        return _geo_cache[ip]
+    try:
+        res = geo_reader.get(ip)
+        if res and "country" in res:
+            code = res["country"]["iso_code"]
+            _geo_cache[ip] = code
+            return code
     except Exception:
         pass
-    _geo_cache[host] = "UNK"
+    _geo_cache[ip] = "UNK"
     return "UNK"
 
 
-def parse_node(link: str) -> Optional[Tuple[str, int, Optional[str], bool, bool]]:
-    """返回 (host, port, sni, is_tls, is_udp) 或 None"""
-    link = link.strip()
-    host = port = sni = None
-    is_tls = is_udp = False
+class NodeInfo:
+    def __init__(self):
+        self.protocol: str = ""
+        self.host: str = ""
+        self.port: int = 0
+        self.sni: Optional[str] = None
+        self.is_tls: bool = False
+        self.is_ws: bool = False
+        self.ws_path: str = "/"
+        self.ws_host: Optional[str] = None
+        self.is_udp: bool = False
 
+
+def parse_node(link: str) -> Optional[NodeInfo]:
+    link = link.strip()
+    node = NodeInfo()
     try:
         if link.startswith("vmess://"):
+            node.protocol = "vmess"
             b64 = link[8:].split("#")[0]
             conf_str = safe_b64decode(b64)
             if not conf_str:
                 return None
             conf = json.loads(conf_str)
-            if not UUID_RE.match(str(conf.get("id", ""))):
+            uid = str(conf.get("id", ""))
+            if not UUID_RE.match(uid) or uid.startswith("00000000"):
                 return None
-            host = conf.get("add")
-            port = conf.get("port")
-            if conf.get("tls") in ("tls", "xtls"):
-                is_tls = True
-                sni = conf.get("sni") or conf.get("host")
+            node.host = str(conf.get("add", "")).strip()
+            node.port = int(conf.get("port", 0))
+            node.is_tls = conf.get("tls") in ("tls", "xtls")
+            node.sni = conf.get("sni") or conf.get("host") or node.host
+
+            net = str(conf.get("net", "")).lower()
+            if net == "ws":
+                node.is_ws = True
+                node.ws_path = conf.get("path") or "/"
+                node.ws_host = conf.get("host") or node.sni
 
         elif link.startswith("ss://"):
+            node.protocol = "ss"
             body = link[5:].split("#")[0]
-            if "@" in body:
-                part = body.split("@", 1)[1]
-            else:
-                decoded = safe_b64decode(body)
-                part = decoded.split("@", 1)[1] if "@" in decoded else ""
-            if part:
-                part = part.split("/?")[0].split("?")[0]
-                if part.startswith("["):
-                    h, p = part.rsplit(":", 1)
-                    host = h.strip("[]")
-                    port = int(p)
-                else:
-                    h, p = part.rsplit(":", 1)
-                    host, port = h, int(p)
+            part = body.split("@", 1)[1] if "@" in body else safe_b64decode(body).split("@", 1)[1]
+            part = part.split("/?")[0].split("?")[0]
+            h, p = (part.rsplit(":", 1) if not part.startswith("[") else part.rsplit("]:", 1))
+            node.host = h.strip("[]")
+            node.port = int(p)
 
         else:
             parsed = urlparse(link)
-            scheme = parsed.scheme.lower()
-            if scheme == "vless" and not UUID_RE.match(str(parsed.username or "")):
-                return None
-            host = parsed.hostname
-            port = parsed.port
+            node.protocol = parsed.scheme.lower()
+            if node.protocol == "vless":
+                uid = str(parsed.username or "")
+                if not UUID_RE.match(uid) or uid.startswith("00000000"):
+                    return None
+            node.host = parsed.hostname or ""
+            node.port = parsed.port or 0
             qs = parse_qs(parsed.query)
             security = (qs.get("security") or [""])[0]
 
-            if scheme == "trojan":
-                is_tls = security != "none"
-            elif scheme in ("hysteria2", "hy2"):
-                is_tls = True
-                is_udp = True
-            elif scheme == "vless":
-                is_tls = security in ("tls", "reality", "auto")
+            if node.protocol == "trojan":
+                node.is_tls = security != "none"
+            elif node.protocol in ("hysteria2", "hy2"):
+                node.is_tls = True
+                node.is_udp = True
+            elif node.protocol == "vless":
+                node.is_tls = security in ("tls", "reality", "auto")
 
-            if is_tls:
-                sni = (qs.get("sni") or qs.get("peer") or [None])[0]
+            if (qs.get("type") or [""])[0].lower() == "ws":
+                node.is_ws = True
+                node.ws_path = (qs.get("path") or ["/"])[0]
+                node.ws_host = (qs.get("host") or [None])[0]
 
-        if port:
-            port = int(port)
-        if not host or not port:
+            if node.is_tls:
+                node.sni = (qs.get("sni") or qs.get("peer") or [node.host])[0]
+
+        if not node.host or not (1 <= node.port <= 65535):
             return None
-        return host, port, sni, is_tls, is_udp
+        return node
     except Exception:
         return None
 
@@ -173,58 +213,136 @@ def rebuild_link(link: str, cc: str, latency_str: str) -> str:
     return parts[0] + "#" + quote(new_remark)
 
 
-async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, float]]:
-    parsed = parse_node(link)
-    if not parsed:
+async def resolve_host(host: str) -> Optional[str]:
+    """异步高效解析 DNS 并进行保留地址拦截"""
+    if is_ip(host):
+        return None if is_reserved(host) else host
+    if host in _dns_cache:
+        return _dns_cache[host]
+
+    try:
+        loop = asyncio.get_running_loop()
+        addr_info = await loop.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+        if not addr_info:
+            _dns_cache[host] = None
+            return None
+        ip = addr_info[0][4][0]
+        if is_reserved(ip):
+            _dns_cache[host] = None
+            return None
+        _dns_cache[host] = ip
+        return ip
+    except Exception:
+        _dns_cache[host] = None
         return None
-    host, port, sni, is_tls, is_udp = parsed
+
+
+async def probe_udp_hy2(resolved_ip: str, port: int) -> Optional[float]:
+    """针对 Hysteria2 进行 UDP/QUIC 连通性探测（不再盲目放行）"""
+    start = time.time()
+    loop = asyncio.get_running_loop()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        # 伪造 QUIC Initial 报文头探测端口是否响应 ICMP Unreachable
+        dummy_quic = b"\xc0\x00\x00\x00\x01\x08" + b"\x00" * 32
+        await loop.sock_connect(sock, (resolved_ip, port))
+        await loop.sock_sendall(sock, dummy_quic)
+
+        # 等待极短时间监听是否收到 ICMP Port Unreachable 错误
+        await asyncio.sleep(0.3)
+        # 尝试再写入一次触发内部 Socket Error
+        await loop.sock_sendall(sock, b"\x00")
+        sock.close()
+        return (time.time() - start) * 1000
+    except (ConnectionRefusedError, OSError):
+        return None
+    except Exception:
+        return None
+
+
+async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, float]]:
+    node = parse_node(link)
+    if not node:
+        return None
 
     async with sem:
+        # 1. 解析 IP 与保留地址阻断
+        resolved_ip = await resolve_host(node.host)
+        if not resolved_ip:
+            return None
+
+        # 2. UDP (Hysteria2) 协议专门检测
+        if node.is_udp:
+            udp_latency = await probe_udp_hy2(resolved_ip, node.port)
+            if udp_latency is None or udp_latency > MAX_LATENCY_MS:
+                return None
+            cc = await asyncio.to_thread(get_country, resolved_ip)
+            return rebuild_link(link, cc, "-HY2"), udp_latency
+
+        # 3. TCP 连接测试
         writer = None
         try:
             start = time.time()
-            if is_udp:
-                latency = 9999.0
-            else:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=TCP_TIMEOUT
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(resolved_ip, node.port),
+                timeout=CONNECT_TIMEOUT,
+            )
+            tcp_ms = (time.time() - start) * 1000
+
+            # 4. TLS 协商
+            if node.is_tls:
+                tls_sni = node.sni or node.host
+                if is_ip(tls_sni):
+                    tls_sni = None
+
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+
+                ssl_start = time.time()
+                await asyncio.wait_for(
+                    writer.start_tls(ctx, server_hostname=tls_sni),
+                    timeout=PROBE_TIMEOUT,
                 )
-                tcp_ms = (time.time() - start) * 1000
-                latency = tcp_ms
+                tcp_ms += (time.time() - ssl_start) * 1000
 
-                if is_tls:
-                    tls_sni = sni
-                    if sni:
-                        try:
-                            ipaddress.ip_address(sni)
-                            tls_sni = None
-                        except ValueError:
-                            pass
+            # 5. 核心：针对 WS (尤其是 CDN 反代) 进行 HTTP 握手嗅探，杀掉 502/521 假活节点
+            if node.is_ws:
+                ws_req = (
+                    f"GET {node.ws_path} HTTP/1.1\r\n"
+                    f"Host: {node.ws_host or node.sni or node.host}\r\n"
+                    f"User-Agent: Mozilla/5.0\r\n"
+                    f"Upgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    f"Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                writer.write(ws_req.encode("utf-8"))
+                await asyncio.wait_for(writer.drain(), timeout=PROBE_TIMEOUT)
 
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
+                resp_header = await asyncio.wait_for(reader.read(256), timeout=PROBE_TIMEOUT)
+                if not resp_header:
+                    return None
 
-                    ssl_start = time.time()
-                    await asyncio.wait_for(
-                        writer.start_tls(ctx, server_hostname=tls_sni),
-                        timeout=SSL_TIMEOUT,
-                    )
-                    latency = tcp_ms + (time.time() - ssl_start) * 1000
+                status_line = resp_header.decode("utf-8", errors="ignore").split("\r\n")[0]
+                # 遇到 CDN 网关失效或阻断（502 Bad Gateway, 521 Server Down, 525, 403 WAF 等），立即丢弃
+                if any(bad in status_line for bad in ("502", "503", "520", "521", "522", "523", "525", "530", "403")):
+                    return None
 
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
-            if not is_udp and latency > MAX_LATENCY_MS:
+            if tcp_ms > MAX_LATENCY_MS:
                 return None
 
-            cc = await asyncio.to_thread(get_country, host)
-            latency_str = "UDP" if is_udp else f"{latency:.0f}ms"
-            new_link = rebuild_link(link, cc, latency_str)
-            return new_link, latency
+            cc = await asyncio.to_thread(get_country, resolved_ip)
+            new_link = rebuild_link(link, cc, f"{tcp_ms:.0f}ms")
+            return new_link, tcp_ms
+
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError, ssl.SSLError):
             return None
         except Exception:
@@ -238,21 +356,18 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
 
 
 async def main() -> None:
-    print("--- 节点快速检测 (TCP + SSL + 延迟筛选) ---")
-    print(f"最大延迟上限={MAX_LATENCY_MS}ms  运行超时上限={MAX_EXECUTION_TIME}s  并发数={CONCURRENCY}")
-
+    print("--- 启动节点深度健康检测 (TCP/TLS + WS协议探测 + UDP探针) ---")
     if not os.path.exists(INPUT_FILE):
         print(f"错误: 未找到输入文件 {INPUT_FILE}")
         return
 
     with open(INPUT_FILE, "r", encoding="utf-8-sig") as f:
-        nodes = list({line.strip() for line in f if line.strip()})
+        nodes = list({line.strip() for line in f if len(line.strip()) > 15 and "://" in line})
     print(f"待检测唯一节点数: {len(nodes)}")
 
     sem = asyncio.Semaphore(CONCURRENCY)
     task_objs = [asyncio.create_task(check_one(n, sem)) for n in nodes]
 
-    print(f"开始检测 (TCP 超时 {TCP_TIMEOUT}s / SSL 超时 {SSL_TIMEOUT}s)...")
     start = time.time()
     valid = []
     done = 0
@@ -260,11 +375,10 @@ async def main() -> None:
 
     for coro in asyncio.as_completed(task_objs):
         if time.time() - start > MAX_EXECUTION_TIME:
-            print(f"\n触发运行时间限制 ({MAX_EXECUTION_TIME} 秒)，终止剩余任务。")
+            print(f"\n达到运行上限 ({MAX_EXECUTION_TIME}s)，强行终止剩余任务")
             for t in task_objs:
                 if not t.done():
                     t.cancel()
-            await asyncio.gather(*task_objs, return_exceptions=True)
             break
 
         try:
@@ -278,41 +392,24 @@ async def main() -> None:
         if done % 50 == 0 or done == total:
             elapsed = time.time() - start
             speed = done / elapsed if elapsed > 0 else 0
-            sys.stdout.write(
-                f"\r进度: {done}/{total} | 存活: {len(valid)} | 速度: {speed:.1f}个/s"
-            )
+            sys.stdout.write(f"\r进度: {done}/{total} | 真实有效: {len(valid)} | 速度: {speed:.1f}/s")
             sys.stdout.flush()
 
     print()
-    tcp_valid = [x for x in valid if x[1] < 9000.0]
-    udp_valid = [x for x in valid if x[1] >= 9000.0]
-    tcp_valid.sort(key=lambda x: x[1])
+    valid.sort(key=lambda x: x[1])
+    final_nodes = [x[0] for x in valid]
 
-    # 不做最大值上限截断，保留所有检测通过的 TCP 与 UDP 节点
-    final_valid = tcp_valid + udp_valid
-    final = [x[0] for x in final_valid]
+    plain_data = "\n".join(final_nodes)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(plain_data)
+    with open(SUB_FILE, "w", encoding="utf-8") as f:
+        f.write(base64.b64encode(plain_data.encode("utf-8")).decode("utf-8"))
 
-    try:
-        plain_data = "\n".join(final)
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write(plain_data)
-        b64_data = base64.b64encode(plain_data.encode("utf-8")).decode("utf-8")
-        with open(SUB_FILE, "w", encoding="utf-8") as f:
-            f.write(b64_data)
-        print(f"检测完成，耗时 {time.time() - start:.1f} 秒")
-        print(f"实际存活并保留节点: {len(final)} 个")
-        if valid:
-            best = tcp_valid[0][1] if tcp_valid else 9999.0
-            if best < 9000:
-                print(f"最优延迟: {best:.1f}ms")
-            else:
-                print("最优节点为 UDP 节点 (无 TCP 延迟记录)")
-    except Exception as e:
-        print(f"保存文件过程发生异常: {e}")
+    print(f"检测完成！耗时: {time.time() - start:.1f}s | 纯净存活节点: {len(final_nodes)} 个")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n用户手动停止测试")
+        print("\n用户手动终止")
