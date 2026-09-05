@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Active node checker: TCP + SSL + WebSocket/HTTP probing + Real UDP check.
+"""Active node checker: TCP + SSL + WebSocket/HTTP probing + Real UDP check + Domestic DoH.
 
 深度健康检查：
 1. 识别 CDN 架构的 WS 节点，发送真实 WebSocket 握手协议，杜绝 Cloudflare 502/521 假活节点。
 2. 修复 Hysteria2 / UDP 盲放行漏洞，进行真实 UDP 探测与 ICMP 错误检测。
 3. 剔除私有保留 IP 及虚拟模板地址。
+4. 集成国内 DoH (阿里 DNS) 解析与 GFW 污染检测，确保大陆环境连通性。
 """
 
 import sys
@@ -20,6 +21,7 @@ import socket
 import ipaddress
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from typing import Optional, Tuple, Dict, Any
+import requests
 
 assert sys.version_info >= (3, 11), "需要 Python 3.11 及以上版本"
 
@@ -56,6 +58,17 @@ RESERVED_NETS = [
     ipaddress.ip_network("fe80::/10"),
 ]
 
+# GFW 常见 DNS 污染节点/虚假响应 IP 列表
+GFW_POLLUTED_IPS = {
+    "127.0.0.1", "0.0.0.0", "1.1.1.1", "8.8.8.8",
+    "37.61.54.158", "46.82.174.68", "59.24.3.173", "64.33.88.161",
+    "64.66.163.251", "65.49.33.6", "69.63.184.130", "72.14.205.99",
+    "78.16.49.15", "93.46.8.89", "128.121.126.139", "159.106.121.75",
+    "169.232.46.12", "178.63.227.114", "202.106.1.2", "202.108.22.5",
+    "203.98.7.65", "207.12.88.98", "208.56.31.43", "209.85.229.20",
+    "209.132.183.181", "243.185.187.39"
+}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("NodeChecker")
 
@@ -85,6 +98,8 @@ def is_ip(host: str) -> bool:
 
 
 def is_reserved(ip_str: str) -> bool:
+    if ip_str in GFW_POLLUTED_IPS:
+        return True
     try:
         ip = ipaddress.ip_address(ip_str)
         return any(ip in net for net in RESERVED_NETS)
@@ -213,15 +228,41 @@ def rebuild_link(link: str, cc: str, latency_str: str) -> str:
     return parts[0] + "#" + quote(new_remark)
 
 
+def _query_doh_sync(host: str) -> Optional[str]:
+    """通过阿里 DoH HTTP API 获取大陆视角的 A 记录解析结果"""
+    url = f"https://dns.alidns.com/resolve?name={host}&type=1"
+    try:
+        resp = requests.get(url, timeout=2.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            answers = data.get("Answer", [])
+            for ans in answers:
+                if ans.get("type") == 1:  # A 记录
+                    ip = ans.get("data", "").strip()
+                    if ip and not is_reserved(ip):
+                        return ip
+    except Exception:
+        pass
+    return None
+
+
 async def resolve_host(host: str) -> Optional[str]:
-    """异步高效解析 DNS 并进行保留地址拦截"""
+    """结合国内 DoH 与系统 DNS 的解析函数，防止 GFW 污染与保留地址"""
     if is_ip(host):
         return None if is_reserved(host) else host
     if host in _dns_cache:
         return _dns_cache[host]
 
+    loop = asyncio.get_running_loop()
+
+    # 优先使用国内 DoH 解析，模拟国内视角
+    doh_ip = await loop.run_in_executor(None, _query_doh_sync, host)
+    if doh_ip:
+        _dns_cache[host] = doh_ip
+        return doh_ip
+
+    # 降级方案：调用系统 DNS 解析并严格剔除保留 IP 和 GFW 污染 IP
     try:
-        loop = asyncio.get_running_loop()
         addr_info = await loop.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
         if not addr_info:
             _dns_cache[host] = None
@@ -267,7 +308,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
         return None
 
     async with sem:
-        # 1. 解析 IP 与保留地址阻断
+        # 1. 解析 IP 与保留地址阻断 (结合国内 DoH + 污染库)
         resolved_ip = await resolve_host(node.host)
         if not resolved_ip:
             return None
@@ -356,7 +397,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
 
 
 async def main() -> None:
-    print("--- 启动节点深度健康检测 (TCP/TLS + WS协议探测 + UDP探针) ---")
+    print("--- 启动节点深度健康检测 (TCP/TLS + WS协议探测 + UDP探针 + 国内DoH解析) ---")
     if not os.path.exists(INPUT_FILE):
         print(f"错误: 未找到输入文件 {INPUT_FILE}")
         return
