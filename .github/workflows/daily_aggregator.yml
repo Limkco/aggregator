@@ -50,28 +50,8 @@ jobs:
           echo "开始抓取最新代码库中的节点..."
           python aggregator.py
 
-      # ================== 阶段 2：粗筛清洗 ==================
-      - name: 2. 过滤广告、虚假配置与测试域名
-        run: |
-          if [ -f filter_nodes.py ]; then
-            python filter_nodes.py
-          fi
-
-      # ================== 阶段 3：深度测活 ==================
-      - name: 3. 准备 GeoIP 离线数据库
-        run: |
-          echo "下载最新 GeoLite2-Country 数据库..."
-          if ! wget -T 15 -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
-            echo "最新数据库下载超时，尝试使用仓库备用库..."
-            [ -f GeoLite2-Country.mmdb ] && cp GeoLite2-Country.mmdb geoip.mmdb || true
-          fi
-
-      - name: 4. 执行深度测活 (TCP/TLS/WS握手嗅探)
-        run: |
-          python check_active.py
-
-      # ================== 阶段 4：合并历史存活节点 ==================
-      - name: 5. 指纹合并（与当前分支上一期 result/nodes.txt 去重）
+      # ================== 阶段 2：合并历史存活节点 ==================
+      - name: 2. 指纹合并（与当前分支上一期 result/nodes.txt 去重）
         run: |
           if [ -f result/nodes.txt ]; then
             echo "发现本地历史 result/nodes.txt，复制进行保活合并..."
@@ -80,6 +60,26 @@ jobs:
           else
             echo "未发现历史 result/nodes.txt（首次运行），跳过合并。"
           fi
+
+      # ================== 阶段 3：全量粗筛清洗 ==================
+      - name: 3. 过滤广告、虚假配置与测试域名
+        run: |
+          if [ -f filter_nodes.py ]; then
+            python filter_nodes.py
+          fi
+
+      # ================== 阶段 4：全量深度测活 ==================
+      - name: 4. 准备 GeoIP 离线数据库
+        run: |
+          echo "下载最新 GeoLite2-Country 数据库..."
+          if ! wget -T 15 -qO geoip.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
+            echo "最新数据库下载超时，尝试使用仓库备用库..."
+            [ -f GeoLite2-Country.mmdb ] && cp GeoLite2-Country.mmdb geoip.mmdb || true
+          fi
+
+      - name: 5. 执行深度测活 (TCP/TLS/WS握手嗅探)
+        run: |
+          python check_active.py
 
       # ================== 阶段 5：保存至当前分支 result 目录 ==================
       - name: 6. 提交最终节点至当前分支 result 目录
