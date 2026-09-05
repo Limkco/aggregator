@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Active node checker: TCP + SSL + WebSocket/HTTP probing + Real UDP check + Domestic DoH + Domestic TCP Ping API + GFW Blocklist.
+"""Active node checker with Mainland China GFW filtering & deep protocol verification.
 
-深度健康检查：
-1. 识别 CDN 架构的 WS 节点，发送真实 WebSocket 握手协议。
-2. Hysteria2 / UDP 探测与 ICMP 错误检测。
-3. 剔除私有保留 IP、虚拟模板地址及 GFW 封锁 IP 黑名单。
-4. 集成国内 DoH 解析 + 国内第三方 TCP Ping API 校验，确保大陆环境连通性。
+核心优化：
+1. 严厉拦截国内被封锁的 SNI 域名（pages.dev, workers.dev 等握手即 RST 域名）。
+2. 识别并拦截未优选的 Cloudflare CDN 假活 IP（海外畅通但大陆阻断）。
+3. 弃用失效的第三方虚假测活接口，采用国内可用性权重过滤。
+4. 真实 TCP + TLS + WebSocket/HTTP 握手，剔除无效与假活节点。
 """
 
 import sys
@@ -36,16 +36,16 @@ INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes.txt"
 SUB_FILE = "sub.txt"
 
-MAX_EXECUTION_TIME = 360.0
-MAX_LATENCY_MS = 1800.0
-CONCURRENCY = 100
+MAX_EXECUTION_TIME = 350.0
+MAX_LATENCY_MS = 1500.0
+CONCURRENCY = 80
 CONNECT_TIMEOUT = 3.0
 PROBE_TIMEOUT = 2.5
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 REMARK_CLEAN_RE = re.compile(r"(?:-[A-Za-z]{2,3}(?:\d+ms|UDP))+$")
 
-# 私有/回环保留地址网段
+# 私有/保留 IP 网段
 RESERVED_NETS = [
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
@@ -56,9 +56,24 @@ RESERVED_NETS = [
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("198.18.0.0/15"),
 ]
 
-# GFW 常见污染/封锁 IP 黑名单库
+# Cloudflare 大陆高阻断默认 IP 段（非国内优化 IP，国内直连必超时的假活 IP）
+CLOUDFLARE_BLOCKED_NETS = [
+    ipaddress.ip_network("172.64.0.0/13"),
+    ipaddress.ip_network("104.16.0.0/13"),
+    ipaddress.ip_network("104.24.0.0/14"),
+    ipaddress.ip_network("108.162.192.0/18"),
+    ipaddress.ip_network("162.158.0.0/15"),
+    ipaddress.ip_network("190.93.240.0/20"),
+    ipaddress.ip_network("188.114.96.0/20"),
+    ipaddress.ip_network("197.234.240.0/22"),
+    ipaddress.ip_network("198.41.128.0/17"),
+]
+
+# GFW 封锁/污染重点 IP 黑名单
 GFW_POLLUTED_IPS = {
     "127.0.0.1", "0.0.0.0", "1.1.1.1", "8.8.8.8",
     "37.61.54.158", "46.82.174.68", "59.24.3.173", "64.33.88.161",
@@ -69,11 +84,12 @@ GFW_POLLUTED_IPS = {
     "209.132.183.181", "243.185.187.39"
 }
 
-# GFW 阻断网段（动态规则拦截）
-GFW_BLOCKED_NETWORKS = [
-    ipaddress.ip_network("198.18.0.0/15"), # Fake IP 网段
-    ipaddress.ip_network("100.64.0.0/10"),  # CGNAT 网段
-]
+# 国内发包即被 RST 的黑名单域名/后缀
+BLOCKED_DOMAINS = (
+    "pages.dev", "workers.dev", "github.io", "herokuapp.com",
+    "vercel.app", "netlify.app", "onrender.com", "railway.app",
+    "fly.dev", "glitch.me", "surfree.org", "cloudfront.net"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("NodeChecker")
@@ -103,14 +119,15 @@ def is_ip(host: str) -> bool:
         return False
 
 
-def is_reserved_or_blocked(ip_str: str) -> bool:
+def is_gfw_blocked(ip_str: str) -> bool:
     if ip_str in GFW_POLLUTED_IPS:
         return True
     try:
         ip = ipaddress.ip_address(ip_str)
         if any(ip in net for net in RESERVED_NETS):
             return True
-        if any(ip in net for net in GFW_BLOCKED_NETWORKS):
+        # 拦截 Cloudflare 未优化普通段（在国内全部断连）
+        if any(ip in net for net in CLOUDFLARE_BLOCKED_NETS):
             return True
         return False
     except ValueError:
@@ -211,6 +228,12 @@ def parse_node(link: str) -> Optional[NodeInfo]:
 
         if not node.host or not (1 <= node.port <= 65535):
             return None
+
+        # 核心过滤：若 SNI 或 Host 属于国内强阻断域名，直接剔除（防止在大陆发送 TLS ClientHello 即刻被 RST）
+        domain_to_check = (node.sni or node.host or "").lower()
+        if any(domain_to_check.endswith(blocked) for blocked in BLOCKED_DOMAINS):
+            return None
+
         return node
     except Exception:
         return None
@@ -239,17 +262,20 @@ def rebuild_link(link: str, cc: str, latency_str: str) -> str:
 
 
 def _query_doh_sync(host: str) -> Optional[str]:
-    """通过阿里 DoH API 获取大陆视角的 DNS 解析结果"""
+    """通过阿里 DoH API 获取中国大陆视角的真实解析结果"""
     url = f"https://dns.alidns.com/resolve?name={host}&type=1"
     try:
         resp = requests.get(url, timeout=2.0)
         if resp.status_code == 200:
             data = resp.json()
+            # Status 0 代表正常解析，非 0 说明国内解析失败/被污染
+            if data.get("Status") != 0:
+                return None
             answers = data.get("Answer", [])
             for ans in answers:
                 if ans.get("type") == 1:
                     ip = ans.get("data", "").strip()
-                    if ip and not is_reserved_or_blocked(ip):
+                    if ip and not is_gfw_blocked(ip):
                         return ip
     except Exception:
         pass
@@ -257,55 +283,21 @@ def _query_doh_sync(host: str) -> Optional[str]:
 
 
 async def resolve_host(host: str) -> Optional[str]:
-    """结合阿里 DoH 与 GFW 黑名单过滤的 DNS 解析"""
+    """通过阿里 DoH 模拟大陆视角的 DNS，过滤被墙 IP"""
     if is_ip(host):
-        return None if is_reserved_or_blocked(host) else host
+        return None if is_gfw_blocked(host) else host
     if host in _dns_cache:
         return _dns_cache[host]
 
     loop = asyncio.get_running_loop()
-
     doh_ip = await loop.run_in_executor(None, _query_doh_sync, host)
     if doh_ip:
         _dns_cache[host] = doh_ip
         return doh_ip
 
-    try:
-        addr_info = await loop.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-        if not addr_info:
-            _dns_cache[host] = None
-            return None
-        ip = addr_info[0][4][0]
-        if is_reserved_or_blocked(ip):
-            _dns_cache[host] = None
-            return None
-        _dns_cache[host] = ip
-        return ip
-    except Exception:
-        _dns_cache[host] = None
-        return None
-
-
-def _check_domestic_tcp_sync(ip: str, port: int) -> bool:
-    """建议一实现：调用国内公测 TCP ping API 验证大陆连通性"""
-    url = f"https://api.ipify.org?format=json" # 示例探测节点，通过国内 API 校验 TCP
-    api_endpoint = f"https://ping.chinaz.com/iframe.ashx?action=testconnection&tcpport={port}&host={ip}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        resp = requests.get(api_endpoint, headers=headers, timeout=2.5)
-        if resp.status_code == 200:
-            # 校验返回结果是否包含成功握手标识
-            if "true" in resp.text.lower() or "ok" in resp.text.lower() or resp.status_code == 200:
-                return True
-    except Exception:
-        pass
-    # 兜底保障：API 请求超时或限流时，退回黑名单+深度协议校验结果，避免误杀
-    return True
-
-
-async def check_domestic_connectivity(ip: str, port: int) -> bool:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _check_domestic_tcp_sync, ip, port)
+    # 若阿里 DoH 解析失败，说明该域名在大陆已无法解析或被阻断
+    _dns_cache[host] = None
+    return None
 
 
 async def probe_udp_hy2(resolved_ip: str, port: int) -> Optional[float]:
@@ -321,8 +313,6 @@ async def probe_udp_hy2(resolved_ip: str, port: int) -> Optional[float]:
         await loop.sock_sendall(sock, b"\x00")
         sock.close()
         return (time.time() - start) * 1000
-    except (ConnectionRefusedError, OSError):
-        return None
     except Exception:
         return None
 
@@ -333,17 +323,12 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
         return None
 
     async with sem:
-        # 1. 解析 IP 与 GFW 被墙黑名单阻断 (建议三)
+        # 1. 解析 IP：强制使用阿里 DoH 解析，如果国内无法解析或解析出被墙 IP，直接过滤
         resolved_ip = await resolve_host(node.host)
         if not resolved_ip:
             return None
 
-        # 2. 调用国内第三方 TCP Ping API 校验大陆可达性 (建议一)
-        is_domestic_reachable = await check_domestic_connectivity(resolved_ip, node.port)
-        if not is_domestic_reachable:
-            return None
-
-        # 3. UDP (Hysteria2) 协议专门检测
+        # 2. UDP 协议 (Hysteria2)
         if node.is_udp:
             udp_latency = await probe_udp_hy2(resolved_ip, node.port)
             if udp_latency is None or udp_latency > MAX_LATENCY_MS:
@@ -351,7 +336,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
             cc = await asyncio.to_thread(get_country, resolved_ip)
             return rebuild_link(link, cc, "-HY2"), udp_latency
 
-        # 4. TCP 连接测试
+        # 3. TCP 连通性测试
         writer = None
         try:
             start = time.time()
@@ -361,7 +346,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
             )
             tcp_ms = (time.time() - start) * 1000
 
-            # 5. TLS 协商
+            # 4. TLS 协商校验
             if node.is_tls:
                 tls_sni = node.sni or node.host
                 if is_ip(tls_sni):
@@ -378,11 +363,12 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
                 )
                 tcp_ms += (time.time() - ssl_start) * 1000
 
-            # 6. WS 握手嗅探 (防 Cloudflare 假活节点)
+            # 5. WebSocket 协议握手探测（杜绝 CDN 假活）
             if node.is_ws:
+                ws_host = node.ws_host or node.sni or node.host
                 ws_req = (
                     f"GET {node.ws_path} HTTP/1.1\r\n"
-                    f"Host: {node.ws_host or node.sni or node.host}\r\n"
+                    f"Host: {ws_host}\r\n"
                     f"User-Agent: Mozilla/5.0\r\n"
                     f"Upgrade: websocket\r\n"
                     f"Connection: Upgrade\r\n"
@@ -397,7 +383,8 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
                     return None
 
                 status_line = resp_header.decode("utf-8", errors="ignore").split("\r\n")[0]
-                if any(bad in status_line for bad in ("502", "503", "520", "521", "522", "523", "525", "530", "403")):
+                # 出现 CDN 报错或 403/502/521 等说明后端早就死亡
+                if any(bad in status_line for bad in ("502", "503", "520", "521", "522", "523", "525", "530", "403", "404")):
                     return None
 
             writer.close()
@@ -413,8 +400,6 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
             new_link = rebuild_link(link, cc, f"{tcp_ms:.0f}ms")
             return new_link, tcp_ms
 
-        except (asyncio.TimeoutError, ConnectionRefusedError, OSError, ssl.SSLError):
-            return None
         except Exception:
             return None
         finally:
@@ -426,7 +411,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
 
 
 async def main() -> None:
-    print("--- 启动节点深度健康检测 (TCP/TLS + WS协议探测 + UDP探针 + 国内DoH + 国内TCP测活API + GFW黑名单) ---")
+    print("--- 启动节点深度健康检测 (过滤GFW重点阻断段+阿里DoH大陆视角+深度握手) ---")
     if not os.path.exists(INPUT_FILE):
         print(f"错误: 未找到输入文件 {INPUT_FILE}")
         return
