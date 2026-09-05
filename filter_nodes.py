@@ -52,7 +52,7 @@ BLACKLIST = [
 ]
 
 # 2. 动态过滤规则列表：可任意添加协议名(如 "trojan")、特征词(如 "reality")或条件表达式(如 "tls=0")
-FILTER_RULES = ["vmess", "reality", "tls=0", "trojan"]
+FILTER_RULES = ["", "", "tls=0"]
 
 
 def safe_b64decode(text: str) -> str:
