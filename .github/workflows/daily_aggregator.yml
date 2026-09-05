@@ -3,7 +3,7 @@ name: Aggregator Daily Build
 on:
   schedule:
     # 每天 UTC 02:00 和 14:00 各运行一次（北京时间 10:00 和 22:00）
-    - cron: '0 2,14 * * *'
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 permissions:
