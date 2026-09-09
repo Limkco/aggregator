@@ -32,7 +32,7 @@ except ImportError:
 
 # ==================== 顶部全局配置区 ====================
 # 动态嗅探的时间窗口（天数）：自动搜索过去 7 天内有代码提交/推送的活跃仓库
-SEARCH_DAYS: int = 7
+SEARCH_DAYS: int = 15
 
 # 搜索全网活跃仓库的关键词
 REPO_SEARCH_KEYWORDS: List[str] = [
