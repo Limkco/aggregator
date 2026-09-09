@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Active node checker: Safe & Gentle (Anti-GitHub-Abuse) + Real Protocol Verification.
 
-安全与防风控设计：
-1. 本地离线预清洗：零网络开销剔除已知 GFW 黑洞段、失效域名与垃圾配置，大幅减少网络发包。
-2. 平缓流量控制：并发限制为安全范围 (15)，杜绝突发性外网端口扫描被 GitHub/Azure 监控标记。
-3. 零第三方个人 API 依赖：完全杜绝因调用外部接口导致的 IP 封禁或 Abuse 投诉。
-4. 真实协议鉴权握手：发送合规的 VLESS / Trojan / WS 协议包，彻底终结客户端测速 -1。
+重构说明：
+1. 传输层解耦：将 WebSocket 与应用层协议 (VLESS/VMess/Trojan) 解耦，先完成 WS 握手 (HTTP 101)，解决 VLESS-WS 被误杀的问题。
+2. 原生支持 UDP/QUIC：针对 Hysteria2 / TUIC 协议，采用 RFC 9000 QUIC 探针测试，避免用 TCP 测 UDP 导致的 100% 误杀。
+3. 严格协议认证：对纯 TCP 的 VLESS 与 Trojan 发送合规鉴权握手头，消灭客户端测速 -1。
+4. 增强健壮性：修复 IPv6 与 IPv4 网段比较时的类型异常，安全可控低并发 (15)。
 """
 
 import sys
@@ -17,12 +17,11 @@ import asyncio
 import ssl
 import time
 import socket
-import struct
 import hashlib
 import uuid
 import ipaddress
 from urllib.parse import urlparse, parse_qs, unquote, quote
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict
 
 assert sys.version_info >= (3, 11), "需要 Python 3.11 及以上版本"
 
@@ -37,10 +36,10 @@ INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes.txt"
 SUB_FILE = "sub.txt"
 
-# 安全风控参数：低并发、平缓发包
+# 安全风控参数
 MAX_EXECUTION_TIME = 330.0
 MAX_LATENCY_MS = 1400.0
-CONCURRENCY = 15          # 严格限制并发，避免被识别为端口扫描 (Port Scanning)
+CONCURRENCY = 15          # 严格限制并发，杜绝云监控识别为端口扫描 (Port Scanning)
 CONNECT_TIMEOUT = 3.0
 PROBE_TIMEOUT = 2.5
 
@@ -62,7 +61,7 @@ RESERVED_NETS = [
     ipaddress.ip_network("198.18.0.0/15"),
 ]
 
-# Cloudflare 大陆高阻断网段（国内直连 100% 丢包/超时的假活 Anycast IP）
+# Cloudflare 大陆高阻断 Anycast 网段
 CLOUDFLARE_BLOCKED_NETS = [
     ipaddress.ip_network("172.64.0.0/13"),
     ipaddress.ip_network("104.16.0.0/12"),
@@ -74,7 +73,7 @@ CLOUDFLARE_BLOCKED_NETS = [
     ipaddress.ip_network("198.41.128.0/17"),
 ]
 
-# GFW 封锁/污染重点 IP
+# GFW 污染常用 IP
 GFW_POLLUTED_IPS = {
     "127.0.0.1", "0.0.0.0", "1.1.1.1", "8.8.8.8",
     "37.61.54.158", "46.82.174.68", "59.24.3.173", "64.33.88.161",
@@ -85,7 +84,7 @@ GFW_POLLUTED_IPS = {
     "209.132.183.181", "243.185.187.39"
 }
 
-# 大陆握手即被 GFW 发送 RST 的高危免费域名（客户端连必死）
+# 阻断域名后缀
 BLOCKED_DOMAINS = (
     "pages.dev", "workers.dev", "github.io", "herokuapp.com",
     "vercel.app", "netlify.app", "onrender.com", "railway.app",
@@ -122,10 +121,12 @@ def is_gfw_blocked_ip(ip_str: str) -> bool:
         return True
     try:
         ip = ipaddress.ip_address(ip_str)
-        if any(ip in net for net in RESERVED_NETS):
-            return True
-        if any(ip in net for net in CLOUDFLARE_BLOCKED_NETS):
-            return True
+        for net in RESERVED_NETS:
+            if ip.version == net.version and ip in net:
+                return True
+        for net in CLOUDFLARE_BLOCKED_NETS:
+            if ip.version == net.version and ip in net:
+                return True
         return False
     except ValueError:
         return False
@@ -204,7 +205,7 @@ def parse_node(link: str) -> Optional[NodeInfo]:
             node.host = parsed.hostname or ""
             node.port = parsed.port or 0
             qs = parse_qs(parsed.query)
-            security = (qs.get("security") or [""])[0]
+            security = (qs.get("security") or [""])[0].lower()
 
             if node.protocol == "vless":
                 node.uuid = str(parsed.username or "")
@@ -216,11 +217,13 @@ def parse_node(link: str) -> Optional[NodeInfo]:
                 if not node.password:
                     return None
                 node.is_tls = security != "none"
-            elif node.protocol in ("hysteria2", "hy2"):
+            elif node.protocol in ("hysteria2", "hy2", "tuic"):
+                node.protocol = "hy2"
                 node.is_tls = True
                 node.is_udp = True
 
-            if (qs.get("type") or [""])[0].lower() == "ws":
+            trans_type = (qs.get("type") or qs.get("transport") or [""])[0].lower()
+            if trans_type == "ws":
                 node.is_ws = True
                 node.ws_path = (qs.get("path") or ["/"])[0]
                 node.ws_host = (qs.get("host") or [None])[0]
@@ -231,12 +234,11 @@ def parse_node(link: str) -> Optional[NodeInfo]:
         if not node.host or not (1 <= node.port <= 65535):
             return None
 
-        # 零网络开销过滤：被 GFW 封锁的域名直接剔除
+        # 离线黑名单过滤
         check_domain = (node.sni or node.host or "").lower()
         if any(check_domain.endswith(bad) for bad in BLOCKED_DOMAINS):
             return None
 
-        # 零网络开销过滤：直接填了 Cloudflare 被墙 IP 的节点直接剔除
         if is_ip(node.host) and is_gfw_blocked_ip(node.host):
             return None
 
@@ -268,7 +270,6 @@ def rebuild_link(link: str, cc: str, latency_str: str) -> str:
 
 
 async def resolve_host_safe(host: str) -> Optional[str]:
-    """使用系统本地安全解析 + GFW 特征阻断库过滤"""
     if is_ip(host):
         return None if is_gfw_blocked_ip(host) else host
     if host in _dns_cache:
@@ -294,7 +295,6 @@ async def resolve_host_safe(host: str) -> Optional[str]:
 def build_vless_probe(uid_str: str) -> bytes:
     """标准 VLESS 握手认证头"""
     u = uuid.UUID(uid_str)
-    # Version(0) + UUID(16B) + AddonsLen(0) + Cmd(1=TCP) + Port(2B) + AddrType(2=Domain) + Len(10) + google.com
     return b"\x00" + u.bytes + b"\x00\x01\x00\x50\x02\x0agoogle.com"
 
 
@@ -304,21 +304,67 @@ def build_trojan_probe(password: str) -> bytes:
     return hex_hash + b"\r\n\x01\x03\x0agoogle.com\x00\x50\r\n"
 
 
+def build_quic_vn_probe() -> bytes:
+    """
+    构造 RFC 9000 QUIC 强制版本协商 (Version Negotiation) 探测包。
+    任何规范的 QUIC/Hysteria2 服务端在收到不支持版本且 >=1200 字节的初始包时，必须回复 Version Negotiation 包。
+    """
+    first_byte = b"\xc0"
+    reserved_version = b"\x0a\x1a\x2a\x3a"  # 保留未分配版本
+    dcid = os.urandom(8)
+    scid = os.urandom(8)
+    header = first_byte + reserved_version + bytes([len(dcid)]) + dcid + bytes([len(scid)]) + scid
+    return header + b"\x00" * (1200 - len(header))
+
+
+async def probe_quic_udp(ip: str, port: int, timeout: float = PROBE_TIMEOUT) -> Optional[float]:
+    """UDP/QUIC 专用握手测活"""
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    try:
+        probe = build_quic_vn_probe()
+        start = time.time()
+        await loop.sock_sendto(sock, probe, (ip, port))
+        data = await asyncio.wait_for(loop.sock_recv(sock, 2048), timeout=timeout)
+        elapsed_ms = (time.time() - start) * 1000
+
+        # RFC 9000: 检查对端返回是否为合法 QUIC VN 包 (Version 字段为 0) 或 QUIC 响应
+        if len(data) >= 5:
+            is_vn = data[1:5] == b"\x00\x00\x00\x00"
+            is_quic = (data[0] & 0x80) != 0
+            if is_vn or is_quic:
+                return elapsed_ms
+        return None
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+
 async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, float]]:
     node = parse_node(link)
     if not node:
         return None
 
     async with sem:
-        # 增加微小抖动，避免瞬时突发流量触发云防火墙风控
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.04)
 
-        # 1. 解析 IP 与已知封锁段过滤
+        # 1. 域名解析与黑名单清洗
         resolved_ip = await resolve_host_safe(node.host)
         if not resolved_ip:
             return None
 
-        # 2. 建立基础 TCP 连接
+        # 2. 分流处理：针对 UDP 协议 (Hysteria 2 / TUIC)
+        if node.is_udp:
+            elapsed_ms = await probe_quic_udp(resolved_ip, node.port)
+            if elapsed_ms is None or elapsed_ms > MAX_LATENCY_MS:
+                return None
+            cc = await asyncio.to_thread(get_country, resolved_ip)
+            new_link = rebuild_link(link, cc, f"{elapsed_ms:.0f}ms")
+            return new_link, elapsed_ms
+
+        # 3. TCP 基础连接
         writer = None
         try:
             start = time.time()
@@ -328,7 +374,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
             )
             elapsed_ms = (time.time() - start) * 1000
 
-            # 3. TLS 协商
+            # 4. TLS 协商 (若启用)
             if node.is_tls:
                 tls_sni = node.sni or node.host
                 if is_ip(tls_sni):
@@ -345,31 +391,15 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
                 )
                 elapsed_ms += (time.time() - ssl_start) * 1000
 
-            # 4. 关键：代理协议握手鉴权（消灭客户端 -1）
-            if node.protocol == "vless":
-                # 发送真实 VLESS 认证
-                writer.write(build_vless_probe(node.uuid))
-                await asyncio.wait_for(writer.drain(), timeout=PROBE_TIMEOUT)
-                # 监听响应：若 UUID 错误或非 VLESS 代理，服务端会断开连接或无合法响应
-                resp = await asyncio.wait_for(reader.read(16), timeout=PROBE_TIMEOUT)
-                if not resp or resp[0] != 0x00:
-                    return None
-
-            elif node.protocol == "trojan":
-                # 发送真实 Trojan 认证
-                writer.write(build_trojan_probe(node.password))
-                await asyncio.wait_for(writer.drain(), timeout=PROBE_TIMEOUT)
-                await asyncio.sleep(0.08)
-                if reader.at_eof():
-                    return None
-
-            elif node.is_ws:
-                # 真实 WebSocket 升级握手探测
+            # 5. 传输层与应用层验证
+            if node.is_ws:
+                # 无论上层是 VLESS / VMess / Trojan，WS 传输必须先成功完成 HTTP 101 Upgrade
                 ws_host = node.ws_host or node.sni or node.host
+                path = node.ws_path if node.ws_path.startswith("/") else ("/" + node.ws_path)
                 ws_req = (
-                    f"GET {node.ws_path} HTTP/1.1\r\n"
+                    f"GET {path} HTTP/1.1\r\n"
                     f"Host: {ws_host}\r\n"
-                    f"User-Agent: Mozilla/5.0\r\n"
+                    f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
                     f"Upgrade: websocket\r\n"
                     f"Connection: Upgrade\r\n"
                     f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
@@ -378,14 +408,32 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
                 writer.write(ws_req.encode("utf-8"))
                 await asyncio.wait_for(writer.drain(), timeout=PROBE_TIMEOUT)
 
-                resp_header = await asyncio.wait_for(reader.read(256), timeout=PROBE_TIMEOUT)
+                resp_header = await asyncio.wait_for(reader.read(512), timeout=PROBE_TIMEOUT)
                 if not resp_header:
                     return None
-
-                status_line = resp_header.decode("utf-8", errors="ignore").split("\r\n")[0]
-                # 必须明确返回 HTTP 101 Switching Protocols
+                status_line = resp_header.split(b"\r\n")[0].decode("latin1", errors="ignore")
                 if "101" not in status_line:
                     return None
+
+            else:
+                # 纯 TCP / TLS 模式下的应用层握手
+                if node.protocol == "vless":
+                    writer.write(build_vless_probe(node.uuid))
+                    await asyncio.wait_for(writer.drain(), timeout=PROBE_TIMEOUT)
+                    resp = await asyncio.wait_for(reader.read(16), timeout=PROBE_TIMEOUT)
+                    if not resp or resp[0] != 0x00:
+                        return None
+
+                elif node.protocol == "trojan":
+                    writer.write(build_trojan_probe(node.password))
+                    await asyncio.wait_for(writer.drain(), timeout=PROBE_TIMEOUT)
+                    # 密码错误时 Trojan 会主动 RST/断开连接
+                    try:
+                        probe_res = await asyncio.wait_for(reader.read(16), timeout=0.15)
+                        if reader.at_eof() or probe_res == b"":
+                            return None
+                    except asyncio.TimeoutError:
+                        pass  # 正常保持连接，鉴权通过
 
             writer.close()
             try:
@@ -411,7 +459,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
 
 
 async def main() -> None:
-    print("--- 启动安全合规深度测活 (真实协议认证 + GFW假活段清洗 + 防风控平缓发包) ---")
+    print("--- 启动全协议深度测活 (WS解耦 + UDP/QUIC握手 + GFW黑洞过滤) ---")
     if not os.path.exists(INPUT_FILE):
         print(f"错误: 未找到输入文件 {INPUT_FILE}")
         return
@@ -419,15 +467,12 @@ async def main() -> None:
     with open(INPUT_FILE, "r", encoding="utf-8-sig") as f:
         raw_lines = [line.strip() for line in f if len(line.strip()) > 15 and "://" in line]
 
-    # 预筛去重
     nodes = list(dict.fromkeys(raw_lines))
     print(f"原始候选节点数: {len(nodes)}")
 
-    # 第一阶段：纯本地离线规则预过滤（零发包，直接剔除已知死域与无效格式）
     pre_filtered = [link for link in nodes if parse_node(link) is not None]
-    print(f"离线规则清洗后进入深度测活节点数: {len(pre_filtered)} (安全减少了约 {len(nodes) - len(pre_filtered)} 次外部连接)")
+    print(f"离线规则预过滤后存活: {len(pre_filtered)} (安全拦截无效节点 {len(nodes) - len(pre_filtered)} 个)")
 
-    # 第二阶段：平缓可控发包探测
     sem = asyncio.Semaphore(CONCURRENCY)
     task_objs = [asyncio.create_task(check_one(n, sem)) for n in pre_filtered]
 
@@ -438,7 +483,7 @@ async def main() -> None:
 
     for coro in asyncio.as_completed(task_objs):
         if time.time() - start > MAX_EXECUTION_TIME:
-            print(f"\n达到安全运行上限 ({MAX_EXECUTION_TIME}s)，温和停止剩余任务")
+            print(f"\n已达单次安全运行上限 ({MAX_EXECUTION_TIME}s)，温和停止剩余检测")
             for t in task_objs:
                 if not t.done():
                     t.cancel()
@@ -468,7 +513,7 @@ async def main() -> None:
     with open(SUB_FILE, "w", encoding="utf-8") as f:
         f.write(base64.b64encode(plain_data.encode("utf-8")).decode("utf-8"))
 
-    print(f"检测完成！安全耗时: {time.time() - start:.1f}s | 纯净存活节点: {len(final_nodes)} 个")
+    print(f"检测完成！耗时: {time.time() - start:.1f}s | 高质量存活节点: {len(final_nodes)} 个")
 
 
 if __name__ == "__main__":
