@@ -126,8 +126,6 @@ class DynamicNodeAggregator:
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "Mozilla/5.0 (NodeFinder/5.0)",
         })
-        if self.github_token:
-            self.session.headers["Authorization"] = f"token {self.github_token}"
 
     def safe_base64_decode(self, text: str) -> Optional[str]:
         if not text:
@@ -228,7 +226,8 @@ class DynamicNodeAggregator:
             if not (1 <= port <= 65535) or is_invalid_host(server) or not password or not method:
                 return None
             user = base64.b64encode(f"{method}:{password}".encode("utf-8")).decode("utf-8").strip()
-            return f"ss://{user}@{server}:{port}#{quote(str(config.get('name', 'ss')))}"
+            authority = f"[{server}]" if ":" in server else server
+            return f"ss://{user}@{authority}:{port}#{quote(str(config.get('name', 'ss')))}"
         except Exception:
             return None
 
@@ -319,7 +318,10 @@ class DynamicNodeAggregator:
             query = f"{keyword} pushed:>{since_date} fork:true"
             api = f"https://api.github.com/search/repositories?q={quote(query)}&sort=updated&order=desc&per_page=15"
             try:
-                resp = self.session.get(api, timeout=10)
+                resp = self.session.get(
+                    api, timeout=10,
+                    headers={"Authorization": f"Bearer {self.github_token}"} if self.github_token else {},
+                )
                 if resp.status_code == 200:
                     repos = resp.json().get("items", [])
                     logger.info(f"关键词 [{keyword}] 命中 {len(repos)} 个活跃仓库")
@@ -348,7 +350,10 @@ class DynamicNodeAggregator:
                 break
             api = f"https://api.github.com/search/code?q={quote(query)}&sort=indexed&order=desc&per_page=20"
             try:
-                resp = self.session.get(api, timeout=10)
+                resp = self.session.get(
+                    api, timeout=10,
+                    headers={"Authorization": f"Bearer {self.github_token}"} if self.github_token else {},
+                )
                 if resp.status_code == 200:
                     items = resp.json().get("items", [])
                     logger.info(f"代码搜索 [{query}] 命中 {len(items)} 个文件")
@@ -366,8 +371,10 @@ class DynamicNodeAggregator:
 
     def run(self) -> None:
         logger.info(f"启动 {DOWNLOAD_WORKERS} 个并发解析工作线程...")
-        for _ in range(DOWNLOAD_WORKERS):
-            threading.Thread(target=self.fetch_worker, daemon=True).start()
+        workers = [threading.Thread(target=self.fetch_worker, daemon=True)
+                   for _ in range(DOWNLOAD_WORKERS)]
+        for worker in workers:
+            worker.start()
 
         # 1. 执行动态活跃仓库探测（过去 SEARCH_DAYS 天）
         self.discover_active_repositories()
@@ -377,13 +384,13 @@ class DynamicNodeAggregator:
 
         # 等待下载队列处理完成
         logger.info("等待所有动态探测到的资源下载与解析...")
-        deadline = time.time() + 30
-        while time.time() < deadline and self.url_queue.unfinished_tasks > 0:
-            time.sleep(0.5)
-
+        self.url_queue.join()
         self.should_stop = True
+        for worker in workers:
+            worker.join()
+        self.session.close()
         with self.nodes_lock:
-            nodes_list = list(self.nodes)
+            nodes_list = sorted(self.nodes)
 
         logger.info(f"=== 动态探测完成！共获取格式有效节点: {len(nodes_list)} 个 ===")
         plain = "\n".join(nodes_list) if nodes_list else ""
