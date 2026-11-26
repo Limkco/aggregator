@@ -29,7 +29,7 @@ try:
     import maxminddb
     GEO_DB = "geoip.mmdb"
     geo_reader = maxminddb.open_database(GEO_DB) if os.path.exists(GEO_DB) else None
-except ImportError:
+except (ImportError, OSError, ValueError):
     geo_reader = None
 
 INPUT_FILE = "nodes.txt"
@@ -213,7 +213,7 @@ def parse_node(link: str) -> Optional[NodeInfo]:
                     return None
                 node.is_tls = security in ("tls", "reality", "auto")
             elif node.protocol == "trojan":
-                node.password = str(parsed.username or "")
+                node.password = unquote(parsed.username or "")
                 if not node.password:
                     return None
                 node.is_tls = security != "none"
@@ -221,6 +221,8 @@ def parse_node(link: str) -> Optional[NodeInfo]:
                 node.protocol = "hy2"
                 node.is_tls = True
                 node.is_udp = True
+            else:
+                return None
 
             trans_type = (qs.get("type") or qs.get("transport") or [""])[0].lower()
             if trans_type == "ws":
@@ -236,7 +238,7 @@ def parse_node(link: str) -> Optional[NodeInfo]:
 
         # 离线黑名单过滤
         check_domain = (node.sni or node.host or "").lower()
-        if any(check_domain.endswith(bad) for bad in BLOCKED_DOMAINS):
+        if any(check_domain == bad or check_domain.endswith("." + bad) for bad in BLOCKED_DOMAINS):
             return None
 
         if is_ip(node.host) and is_gfw_blocked_ip(node.host):
@@ -320,7 +322,7 @@ def build_quic_vn_probe() -> bytes:
 async def probe_quic_udp(ip: str, port: int, timeout: float = PROBE_TIMEOUT) -> Optional[float]:
     """UDP/QUIC 专用握手测活"""
     loop = asyncio.get_running_loop()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     try:
         probe = build_quic_vn_probe()
@@ -412,7 +414,7 @@ async def check_one(link: str, sem: asyncio.Semaphore) -> Optional[Tuple[str, fl
                 if not resp_header:
                     return None
                 status_line = resp_header.split(b"\r\n")[0].decode("latin1", errors="ignore")
-                if "101" not in status_line:
+                if status_line.split()[1:2] != ["101"]:
                     return None
 
             else:
@@ -481,27 +483,25 @@ async def main() -> None:
     done = 0
     total = len(task_objs)
 
-    for coro in asyncio.as_completed(task_objs):
-        if time.time() - start > MAX_EXECUTION_TIME:
-            print(f"\n已达单次安全运行上限 ({MAX_EXECUTION_TIME}s)，温和停止剩余检测")
-            for t in task_objs:
-                if not t.done():
-                    t.cancel()
-            break
-
-        try:
-            res = await coro
-            done += 1
-            if res:
-                valid.append(res)
-        except asyncio.CancelledError:
-            pass
-
-        if done % 10 == 0 or done == total:
-            elapsed = time.time() - start
-            speed = done / elapsed if elapsed > 0 else 0
-            sys.stdout.write(f"\r进度: {done}/{total} | 真实可用: {len(valid)} | 速率: {speed:.1f}/s")
-            sys.stdout.flush()
+    try:
+        async with asyncio.timeout(MAX_EXECUTION_TIME):
+            for coro in asyncio.as_completed(task_objs):
+                res = await coro
+                done += 1
+                if res:
+                    valid.append(res)
+                if done % 10 == 0 or done == total:
+                    elapsed = time.time() - start
+                    speed = done / elapsed if elapsed > 0 else 0
+                    sys.stdout.write(f"\r进度: {done}/{total} | 探测通过: {len(valid)} | 速率: {speed:.1f}/s")
+                    sys.stdout.flush()
+    except TimeoutError:
+        print(f"\n已达运行上限 ({MAX_EXECUTION_TIME}s)，停止剩余检测")
+    finally:
+        for task in task_objs:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*task_objs, return_exceptions=True)
 
     print()
     valid.sort(key=lambda x: x[1])

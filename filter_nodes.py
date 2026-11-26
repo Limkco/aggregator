@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+from urllib.parse import parse_qs, unquote, urlparse
 
 INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "nodes.txt"
@@ -70,7 +71,7 @@ def safe_b64decode(text: str) -> str:
 
 def extract_searchable_text(link: str) -> str:
     """提取链接所有可显文本（包括 Base64 内部）用于敏感词拦截"""
-    text = link.lower()
+    text = unquote(link).lower()
     if link.startswith("vmess://"):
         conf = safe_b64decode(link[8:].split("#")[0])
         return text + " " + conf.lower()
@@ -89,7 +90,9 @@ def should_filter_node(link: str, rules: list) -> bool:
             conf_str = safe_b64decode(link[8:].split("#")[0])
             if conf_str:
                 vmess_json_str = conf_str.lower()
-                vmess_conf = json.loads(conf_str)
+                parsed_conf = json.loads(conf_str)
+                if isinstance(parsed_conf, dict):
+                    vmess_conf = parsed_conf
         except Exception:
             pass
 
@@ -105,11 +108,19 @@ def should_filter_node(link: str, rules: list) -> bool:
                 if tls_val in ["", "none", "0", "false"]:
                     return True
             else:
-                has_tls = (
-                    "security=tls" in link_lower
-                    or "security=reality" in link_lower
-                    or "tls=1" in link_lower
-                )
+                try:
+                    parsed = urlparse(link)
+                    qs = parse_qs(parsed.query, keep_blank_values=True)
+                    security = qs.get("security", [None])[0]
+                    tls = qs.get("tls", [None])[0]
+                    if security is not None:
+                        has_tls = security.lower() in ("tls", "reality", "auto")
+                    elif tls is not None:
+                        has_tls = tls.lower() in ("1", "true", "tls")
+                    else:
+                        has_tls = parsed.scheme.lower() in ("trojan", "hysteria2", "hy2", "tuic")
+                except ValueError:
+                    has_tls = False
                 if not has_tls:
                     return True
             continue

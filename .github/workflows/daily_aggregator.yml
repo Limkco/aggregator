@@ -3,7 +3,7 @@ name: Aggregator Daily Build
 on:
   schedule:
     # 每天 UTC 02:00 和 14:00 各运行一次（北京时间 10:00 和 22:00）
-    - cron: '0 2 * * *'
+    - cron: '0 2,14 * * *'
   workflow_dispatch:
 
 permissions:
@@ -14,33 +14,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出当前分支代码
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ================== 自动准备依赖清单 ==================
-      - name: 检查并自动创建 requirements.txt 清单
-        run: |
-          if [ ! -f requirements.txt ]; then
-            echo "未检测到 requirements.txt，使用 printf 安全生成..."
-            printf "requests\nPyYAML\nmaxminddb\n" > requirements.txt
-            echo "requirements.txt 创建成功，内容如下："
-            cat requirements.txt
-          else
-            echo "已检测到 requirements.txt，跳过生成。"
-          fi
-
       # ================== 配置 Python 并启用 Pip 缓存 ==================
       - name: 配置 Python 环境 (已启用 Pip 缓存)
-        uses: actions/setup-python@main
+        uses: actions/setup-python@v5
         with:
-          python-version: 'x'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: 安装必要依赖
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: 运行离线回归测试
+        run: python -m unittest discover -s tests -v
 
       # ================== 阶段 1：采集新鲜节点 ==================
       - name: 1. 抓取 GitHub 最新活跃节点
